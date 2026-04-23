@@ -1,3 +1,4 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pwright/SCUM)
 # Source Control Under Management
 
 A local-first metadata tracker for files using **SQLite for metadata only** and a **copy-on-write object store** on disk for preserved file contents.
