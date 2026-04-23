@@ -1,0 +1,11 @@
+{
+  "attribute": {
+    "description": "First AsciiDoc header extracted as JSON",
+    "ident": "asciidoc/header"
+  },
+  "entrypoint": "run.py",
+  "file_patterns": [
+    "*.adoc"
+  ],
+  "mime_prefixes": []
+}

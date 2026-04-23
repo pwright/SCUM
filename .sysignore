@@ -1,0 +1,32 @@
+# VCS
+.git/
+.hg/
+.svn/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Build and temp
+build/
+dist/
+tmp/
+temp/
+*.tmp
+*.swp
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Internal store
+.sysstore/
+.sysmvp.db

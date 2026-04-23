@@ -1,0 +1,21 @@
+{
+  "attribute": {
+    "description": "Embedded image metadata",
+    "ident": "image/metadata"
+  },
+  "entrypoint": "run.py",
+  "file_patterns": [
+    "*.avif",
+    "*.gif",
+    "*.heic",
+    "*.jpeg",
+    "*.jpg",
+    "*.png",
+    "*.tif",
+    "*.tiff",
+    "*.webp"
+  ],
+  "mime_prefixes": [
+    "image/"
+  ]
+}

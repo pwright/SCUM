@@ -1,0 +1,11 @@
+{
+  "attribute": {
+    "description": "Picasa .picasa.ini metadata with captions and album membership",
+    "ident": "picasa/ini"
+  },
+  "entrypoint": "run.py",
+  "file_patterns": [
+    "*.picasa.ini"
+  ],
+  "mime_prefixes": []
+}

@@ -1,0 +1,13 @@
+{
+  "extensions": {
+    "asciidoc_header": {
+      "enabled": true
+    },
+    "image_metadata": {
+      "enabled": true
+    },
+    "picasa_ini": {
+      "enabled": true
+    }
+  }
+}
