@@ -281,16 +281,6 @@ This is intentionally narrow.
 - no parallel hashing yet
 - no live watch mode yet
 
-## Extending it
-
-Good next steps:
-
-- add `file_version` entities
-- add tag and note commands
-- add extractors for image, PDF, code, audio, video
-- add derived artifacts like thumbnails or extracted text
-- add current-state materialized tables for hot queries
-- add tests around as-of semantics and retractions
 
 ## Development
 

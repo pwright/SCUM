@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 DB_NAME = ".sysmvp.db"
 STORE_DIR = ".sysstore/objects"
 GIT_STATE_OPTIONS = ("clean", "modified", "added", "renamed", "copied", "untracked")
-VIEW_OPTIONS = ("files", "repos", "blobs", "tx", "sql")
+VIEW_OPTIONS = ("files", "duplicates", "repos", "blobs", "tx", "sql")
 SQL_QUERY_ROW_LIMIT = 200
 SQL_QUERY_DEFAULT = """SELECT
   fe.current_path,
@@ -228,18 +228,22 @@ def fetch_stats(root: Path, path_prefix: str, branch: str, git_state: str) -> di
     file_join = ""
     blob_join = ""
     tx_join = ""
+    duplicate_join = ""
     file_state_filter = ""
     blob_state_filter = ""
     tx_state_filter = ""
+    duplicate_state_filter = ""
     if repo_ctx is not None and active_branch:
         cte, cte_params = latest_branch_scope_cte(repo_ctx.repo_root, active_branch)
         file_join = "JOIN branch_scope bs ON bs.file_id = fe.file_id"
         blob_join = "JOIN branch_scope bs ON bs.file_id = fe.file_id"
         tx_join = "JOIN branch_scope bs ON bs.file_id = fe.file_id"
+        duplicate_join = "JOIN branch_scope bs_all ON bs_all.file_id = fe_all.file_id"
         if active_git_state:
             file_state_filter = "AND bs.git_state = ?"
             blob_state_filter = "AND bs.git_state = ?"
             tx_state_filter = "AND bs.git_state = ?"
+            duplicate_state_filter = "AND bs_all.git_state = ?"
     conn = connect_db(root)
     try:
         row = conn.execute(
@@ -284,7 +288,32 @@ def fetch_stats(root: Path, path_prefix: str, branch: str, git_state: str) -> di
                             OR lower(COALESCE(fe.current_path, fe.canonical_uri)) = ?
                             OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
                       )
-                ) AS tx_count
+                ) AS tx_count,
+                (
+                    SELECT COUNT(*)
+                    FROM file_entry fe
+                    {file_join}
+                    WHERE fe.is_deleted = 0
+                      AND fe.current_hash IS NOT NULL
+                      AND COALESCE(fe.current_size_bytes, 0) > 0
+                      {file_state_filter}
+                      AND (
+                            ? = ''
+                            OR lower(COALESCE(fe.current_path, fe.canonical_uri)) = ?
+                            OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
+                      )
+                      AND fe.current_hash IN (
+                            SELECT fe_all.current_hash
+                            FROM file_entry fe_all
+                            {duplicate_join}
+                            WHERE fe_all.is_deleted = 0
+                              AND fe_all.current_hash IS NOT NULL
+                              AND COALESCE(fe_all.current_size_bytes, 0) > 0
+                              {duplicate_state_filter}
+                            GROUP BY fe_all.current_hash
+                            HAVING COUNT(*) > 1
+                      )
+                ) AS duplicate_files_count
             """
             ,
             cte_params + (
@@ -300,12 +329,18 @@ def fetch_stats(root: Path, path_prefix: str, branch: str, git_state: str) -> di
                 normalized_path,
                 normalized_path,
                 path_like,
+                *((active_git_state,) if active_git_state else ()),
+                normalized_path,
+                normalized_path,
+                path_like,
+                *((active_git_state,) if active_git_state else ()),
             ),
         ).fetchone()
         return {
             "files_count": int(row["files_count"]),
             "blobs_count": int(row["blobs_count"]),
             "tx_count": int(row["tx_count"]),
+            "duplicate_files_count": int(row["duplicate_files_count"]),
             "repos_count": len(repo_summaries),
         }
     finally:
@@ -574,6 +609,48 @@ def fetch_file_detail(root: Path, file_id: int, path_prefix: str, branch: str) -
         conn.close()
 
 
+def fetch_matching_hash_rows(root: Path, file_id: int) -> tuple[Optional[sqlite3.Row], list[sqlite3.Row]]:
+    conn = connect_db(root)
+    try:
+        file_row = conn.execute(
+            """
+            SELECT file_id, canonical_uri, current_hash, current_size_bytes
+            FROM file_entry
+            WHERE file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+        if file_row is None or not file_row["current_hash"] or int(file_row["current_size_bytes"] or 0) == 0:
+            return file_row, []
+        rows = conn.execute(
+            """
+            SELECT
+                fe.file_id,
+                fe.canonical_uri,
+                t.tx_time,
+                MAX(CASE WHEN a.ident = 'fs/path' THEN f2.value_text END) AS path_at_time
+            FROM fact f
+            JOIN attribute a_hash ON a_hash.attr_id = f.attr_id AND a_hash.ident = 'fs/blob_hash'
+            JOIN tx t ON t.tx_id = f.tx_id
+            JOIN file_entry fe ON fe.file_id = f.entity_id
+            JOIN fact f2 ON f2.entity_id = f.entity_id AND f2.tx_id = f.tx_id
+            JOIN attribute a ON a.attr_id = f2.attr_id AND a.ident = 'fs/path'
+            JOIN fact f_size ON f_size.entity_id = f.entity_id AND f_size.tx_id = f.tx_id
+            JOIN attribute a_size ON a_size.attr_id = f_size.attr_id AND a_size.ident = 'fs/size_bytes'
+            WHERE f.value_blobref = ?
+              AND f.added = 1
+              AND f_size.value_int > 0
+            GROUP BY fe.file_id, fe.canonical_uri, t.tx_id, t.tx_time
+            ORDER BY t.tx_time DESC, t.tx_id DESC
+            LIMIT 200
+            """,
+            (file_row["current_hash"],),
+        ).fetchall()
+        return file_row, rows
+    finally:
+        conn.close()
+
+
 def fetch_blobs(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
     like = f"%{query.lower()}%"
     normalized_path = normalize_path_prefix(path_prefix).lower()
@@ -622,6 +699,101 @@ def fetch_blobs(root: Path, query: str, path_prefix: str, branch: str, git_state
             cte_params
             + ((active_git_state,) if active_git_state else ())
             + (query, like, like, normalized_path, normalized_path, path_like),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_duplicate_files(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
+    like = f"%{query.lower()}%"
+    normalized_path = normalize_path_prefix(path_prefix).lower()
+    path_like = f"{normalized_path}/%" if normalized_path else ""
+    repo_ctx, active_branch = resolve_active_branch(root, path_prefix, branch)
+    active_git_state = resolve_active_git_state(root, path_prefix, branch, git_state)
+    cte = ""
+    cte_params: tuple[object, ...] = ()
+    scope_join = ""
+    duplicate_join = ""
+    file_state_filter = ""
+    duplicate_state_filter = ""
+    if repo_ctx is not None and active_branch:
+        cte, cte_params = latest_branch_scope_cte(repo_ctx.repo_root, active_branch)
+        scope_join = "JOIN branch_scope bs ON bs.file_id = fe.file_id"
+        duplicate_join = "JOIN branch_scope bs_all ON bs_all.file_id = fe_all.file_id"
+        if active_git_state:
+            file_state_filter = "AND bs.git_state = ?"
+            duplicate_state_filter = "AND bs_all.git_state = ?"
+    conn = connect_db(root)
+    try:
+        return conn.execute(
+            f"""
+            {cte}
+            WITH duplicate_hashes AS (
+                SELECT fe_all.current_hash, COUNT(*) AS matches_count
+                FROM file_entry fe_all
+                {duplicate_join}
+                WHERE fe_all.is_deleted = 0
+                  AND fe_all.current_hash IS NOT NULL
+                  AND COALESCE(fe_all.current_size_bytes, 0) > 0
+                  {duplicate_state_filter}
+                GROUP BY fe_all.current_hash
+                HAVING COUNT(*) > 1
+            ),
+            filtered_scope AS (
+                SELECT
+                    fe.file_id,
+                    fe.canonical_uri,
+                    fe.current_path,
+                    fe.current_hash,
+                    fe.current_size_bytes
+                FROM file_entry fe
+                {scope_join}
+                JOIN duplicate_hashes dh ON dh.current_hash = fe.current_hash
+                WHERE fe.is_deleted = 0
+                  AND fe.current_hash IS NOT NULL
+                  AND COALESCE(fe.current_size_bytes, 0) > 0
+                  {file_state_filter}
+                  AND (
+                        ? = ''
+                        OR lower(COALESCE(fe.current_path, fe.canonical_uri)) = ?
+                        OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
+                      )
+                  AND (
+                        ? = ''
+                        OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
+                        OR lower(fe.current_hash) LIKE ?
+                      )
+            ),
+            representative_files AS (
+                SELECT current_hash, MIN(file_id) AS representative_file_id
+                FROM filtered_scope
+                GROUP BY current_hash
+            )
+            SELECT
+                fs.file_id,
+                fs.canonical_uri,
+                fs.current_path,
+                fs.current_hash,
+                fs.current_size_bytes,
+                dh.matches_count
+            FROM filtered_scope fs
+            JOIN representative_files rf ON rf.representative_file_id = fs.file_id
+            JOIN duplicate_hashes dh ON dh.current_hash = fs.current_hash
+            ORDER BY dh.matches_count DESC, lower(COALESCE(fs.current_path, fs.canonical_uri)), fs.file_id
+            LIMIT 500
+            """,
+            cte_params
+            + (
+                *((active_git_state,) if active_git_state else ()),
+                *((active_git_state,) if active_git_state else ()),
+                *((active_git_state,) if active_git_state else ()),
+                normalized_path,
+                normalized_path,
+                path_like,
+                query,
+                like,
+                like,
+            ),
         ).fetchall()
     finally:
         conn.close()
@@ -1084,6 +1256,7 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
         {render_path_filter(root, initial_path, initial_branch, initial_git_state)}
         <div class="nav">
           {nav_button("files", initial_view)}
+          {nav_button("duplicates", initial_view)}
           {nav_button("repos", initial_view)}
           {nav_button("blobs", initial_view)}
           {nav_button("tx", initial_view)}
@@ -1101,7 +1274,7 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
 
 
 def nav_button(name: str, active: str) -> str:
-    labels = {"files": "Files", "repos": "Repos", "blobs": "Blobs", "tx": "Transactions", "sql": "SQL"}
+    labels = {"files": "Files", "duplicates": "Duplicates", "repos": "Repos", "blobs": "Blobs", "tx": "Transactions", "sql": "SQL"}
     active_class = "active" if name == active else ""
     return (
         f'<button class="{active_class}" hx-get="/partials/{name}" '
@@ -1176,6 +1349,9 @@ def render_stats_panel(root: Path, path_prefix: str, branch: str, git_state: str
 <div id="stats-panel" class="panel hero-card"{oob_attr}>
   <div class="stats">
     <div class="stat"><span>Files</span><strong>{stats['files_count']}</strong></div>
+    <button class="stat stat-link" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+      <span>Duplicate Files</span><strong>{stats['duplicate_files_count']}</strong>
+    </button>
     <div class="stat"><span>Blobs</span><strong>{stats['blobs_count']}</strong></div>
     <div class="stat"><span>Transactions</span><strong>{stats['tx_count']}</strong></div>
     <button class="stat stat-link" hx-get="/partials/repos" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
@@ -1291,6 +1467,15 @@ def render_file_detail(root: Path, file_id: int, path_prefix: str, branch: str) 
     preview = render_blob_preview(root, blob_hash, file_row["current_kind"], file_row["current_mime"]) if blob_hash else ""
     versions_html = render_version_history_table(version_rows, blob_hash)
     history_html = render_history_table(history_rows)
+    if blob_hash:
+        matching_hash_action = (
+            f'<button type="button" hx-get="/partials/files/{file_id}/matching-hashes" '
+            f'hx-target="#matching-hash-results" hx-swap="innerHTML">Find matching hashes</button>'
+        )
+        matching_hash_results = '<p class="subtitle">Find duplicates and earlier observed locations for this blob hash.</p>'
+    else:
+        matching_hash_action = ""
+        matching_hash_results = empty_state("No preserved blob hash is available for this file.")
     branch_rows = ""
     if active_branch:
         branch_rows = (
@@ -1318,6 +1503,11 @@ def render_file_detail(root: Path, file_id: int, path_prefix: str, branch: str) 
     </table>
   </div>
   <div id="blob-preview-panel">{preview}</div>
+  <div class="card">
+    <h3>Matching Hashes</h3>
+    <div class="toolbar">{matching_hash_action}</div>
+    <div id="matching-hash-results">{matching_hash_results}</div>
+  </div>
   <div class="card">
     <h3>Version History</h3>
     {versions_html}
@@ -1529,6 +1719,42 @@ def render_version_history_table(rows: list[sqlite3.Row], current_blob_hash: Opt
     return "<table><thead><tr><th>Time</th><th>Size</th><th>Type</th><th>Blob</th><th>Actions</th></tr></thead><tbody>" + "".join(body) + "</tbody></table>"
 
 
+def render_matching_hashes_partial(root: Path, file_id: int) -> str:
+    file_row, rows = fetch_matching_hash_rows(root, file_id)
+    if file_row is None:
+        return empty_state(f"File entity {file_id} was not found.")
+    if int(file_row["current_size_bytes"] or 0) == 0:
+        return empty_state("Empty files are excluded from hash-match reporting.")
+    if not file_row["current_hash"]:
+        return empty_state("No preserved blob hash is available for this file.")
+    if not rows:
+        return empty_state("No matching blob hashes were found.")
+
+    body = []
+    for row in rows:
+        file_link = (
+            f'<a class="mono" href="#" hx-get="/partials/files/{row["file_id"]}" '
+            f'hx-include="#path-filter, #files-query-form" hx-target="#file-detail" hx-swap="innerHTML">'
+            f"{h(row['canonical_uri'])}</a>"
+        )
+        current_label = '<span class="subtitle"> current file</span>' if row["file_id"] == file_id else ""
+        body.append(
+            f"""
+<tr>
+  <th>{file_link}{current_label}</th>
+  <td>{h(row["path_at_time"] or "-")}</td>
+  <td>{h(row["tx_time"])}</td>
+</tr>
+"""
+        )
+    return (
+        '<p class="subtitle">Showing every transaction where this blob hash was observed.</p>'
+        + "<table><thead><tr><th>File</th><th>Observed Path</th><th>Time</th></tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table>"
+    )
+
+
 def render_history_table(rows: list[sqlite3.Row]) -> str:
     if not rows:
         return empty_state("No facts recorded for this entity.")
@@ -1583,6 +1809,44 @@ def render_blobs_partial(root: Path, query: str, path_prefix: str, branch: str, 
     <input type="search" name="q" value="{h(query)}" placeholder="Filter by blob hash or storage path">
     <button type="submit">Search</button>
   </form>
+  <div class="card">{table}</div>
+</div>
+"""
+
+
+def render_duplicates_partial(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> str:
+    rows = fetch_duplicate_files(root, query, path_prefix, branch, git_state)
+    if rows:
+        body = "".join(
+            f"""
+<tr>
+  <th><a class="mono" href="{h(build_browser_url('files', path_prefix, branch, git_state, selected_file_id=int(row['file_id'])))}">{h(row["current_path"] or row["canonical_uri"])}</a></th>
+  <td>{h(row["matches_count"])}</td>
+  <td>{fmt_bytes(row["current_size_bytes"])}</td>
+  <td class="mono">{h(row["current_hash"])}</td>
+</tr>
+"""
+            for row in rows
+        )
+        summary = (
+            f'<p class="subtitle">Returned {len(rows)} duplicate hash group'
+            f'{"s" if len(rows) != 1 else ""}. Each row shows one representative current file for a shared blob hash.</p>'
+        )
+        table = (
+            "<table><thead><tr><th>File</th><th>Matches</th><th>Size</th><th>Blob Hash</th></tr></thead><tbody>"
+            + body
+            + "</tbody></table>"
+        )
+    else:
+        summary = '<p class="subtitle">No current files with shared blob hashes matched this scope.</p>'
+        table = empty_state("No duplicate files matched this query.")
+    return f"""
+<div class="stack">
+  <form class="toolbar" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <input type="search" name="q" value="{h(query)}" placeholder="Filter duplicate files by path or hash">
+    <button type="submit">Show Duplicates</button>
+  </form>
+  {summary}
   <div class="card">{table}</div>
 </div>
 """
@@ -1761,6 +2025,8 @@ def render_root_content(
 ) -> str:
     if view == "repos":
         return render_repos_partial(root, path_prefix)
+    if view == "duplicates":
+        return render_duplicates_partial(root, query, path_prefix, branch, git_state)
     if view == "blobs":
         return render_blobs_partial(root, query, path_prefix, branch, git_state)
     if view == "tx":
@@ -1809,11 +2075,23 @@ class BrowserHandler(BaseHTTPRequestHandler):
                 headers={"HX-Push-Url": build_browser_url("repos", path_prefix, branch, git_state)},
             )
             return
+        if path == "/partials/duplicates":
+            content = render_duplicates_partial(self.repo_root, text_query, path_prefix, branch, git_state)
+            self.respond_html(
+                render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
+                headers={"HX-Push-Url": build_browser_url("duplicates", path_prefix, branch, git_state, text_query)},
+            )
+            return
         if path == "/partials/path-suggestions":
             self.respond_html(render_path_suggestions(self.repo_root, path_prefix))
             return
         if path.startswith("/partials/files/"):
             tail = path.removeprefix("/partials/files/")
+            if tail.endswith("/matching-hashes"):
+                file_id_text = tail.removesuffix("/matching-hashes").rstrip("/")
+                if file_id_text.isdigit():
+                    self.respond_html(render_matching_hashes_partial(self.repo_root, int(file_id_text)))
+                    return
             if tail.isdigit():
                 file_id = int(tail)
                 self.respond_html(

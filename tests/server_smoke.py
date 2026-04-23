@@ -59,6 +59,23 @@ def main() -> int:
         alpha_path.write_text("alpha\n", encoding="utf-8")
         beta_path.write_text("beta\n", encoding="utf-8")
         subprocess.run(["python3", "sysmvp.py", "scan", "--root", "demo"], cwd=repo_dir, check=True)
+        dupes_dir = repo_dir / "dupes"
+        dupes_dir.mkdir()
+        alpha_copy_path = dupes_dir / "a-copy.txt"
+        alpha_copy_path.write_text("alpha\n", encoding="utf-8")
+        subprocess.run(["python3", "sysmvp.py", "scan", "--root", "dupes"], cwd=repo_dir, check=True)
+        moved_dir = repo_dir / "moved"
+        moved_dir.mkdir()
+        alpha_moved_path = moved_dir / "alpha-old.txt"
+        alpha_moved_path.write_text("alpha\n", encoding="utf-8")
+        subprocess.run(["python3", "sysmvp.py", "scan", "--root", "moved"], cwd=repo_dir, check=True)
+        empty_dupes_dir = repo_dir / "empty_dupes"
+        empty_dupes_dir.mkdir()
+        empty_a_path = empty_dupes_dir / "a.txt"
+        empty_b_path = empty_dupes_dir / "b.txt"
+        empty_a_path.write_text("", encoding="utf-8")
+        empty_b_path.write_text("", encoding="utf-8")
+        subprocess.run(["python3", "sysmvp.py", "scan", "--root", "empty_dupes"], cwd=repo_dir, check=True)
         other_dir = repo_dir / "other"
         other_dir.mkdir()
         gamma_path = other_dir / "c.txt"
@@ -305,6 +322,15 @@ def main() -> int:
                     """
                 ).fetchone()[0]
             )
+            empty_a_file_id = int(
+                conn.execute(
+                    """
+                    SELECT file_id
+                    FROM file_entry
+                    WHERE current_path = 'empty_dupes/a.txt'
+                    """
+                ).fetchone()[0]
+            )
         finally:
             conn.close()
 
@@ -324,6 +350,7 @@ def main() -> int:
             assert "SCUM Browser" in index_html
             assert "Stats scope: <span class=\"mono\">Scoped to demo</span>" in index_html
             assert "<div class=\"stat\"><span>Files</span><strong>2</strong></div>" in index_html
+            assert "<span>Duplicate Files</span><strong>1</strong>" in index_html
             assert "<div class=\"stat\"><span>Blobs</span><strong>2</strong></div>" in index_html
             assert "<div class=\"stat\"><span>Transactions</span><strong>2</strong></div>" in index_html
             assert "demo/a.txt" in index_html
@@ -337,6 +364,7 @@ def main() -> int:
             assert 'hx-swap-oob="outerHTML"' in files_partial_html
             assert "Scoped to demo" in files_partial_html
             assert "<div class=\"stat\"><span>Files</span><strong>2</strong></div>" in files_partial_html
+            assert "<span>Duplicate Files</span><strong>1</strong>" in files_partial_html
             assert files_partial_headers["HX-Push-Url"] == "/?view=files&path=demo"
 
             suggestion_html = http_get_text(base_url + "/partials/path-suggestions?path=de")
@@ -347,8 +375,48 @@ def main() -> int:
             detail_html = http_get_text(base_url + "/partials/files/1")
             assert "Fact History" in detail_html
             assert "Blob Preview" in detail_html
+            assert "Matching Hashes" in detail_html
+            assert "Find matching hashes" in detail_html
             assert "alpha" in detail_html
             assert blob_hash in detail_html
+
+            matching_hashes_html = http_get_text(base_url + "/partials/files/1/matching-hashes")
+            assert "Showing every transaction where this blob hash was observed." in matching_hashes_html
+            assert "demo/a.txt" in matching_hashes_html
+            assert "dupes/a-copy.txt" in matching_hashes_html
+            assert "moved/alpha-old.txt" in matching_hashes_html
+            assert "current file" in matching_hashes_html
+
+            duplicates_html, duplicates_headers = http_get_text_with_headers(base_url + "/partials/duplicates?path=demo")
+            assert "Show Duplicates" in duplicates_html
+            assert "Returned 1 duplicate hash group." in duplicates_html
+            assert "demo/a.txt" in duplicates_html
+            assert "dupes/a-copy.txt" not in duplicates_html
+            assert "moved/alpha-old.txt" not in duplicates_html
+            assert f">{blob_hash}</a>" not in duplicates_html
+            assert f">{blob_hash}</td>" in duplicates_html
+            assert "<td>3</td>" in duplicates_html
+            assert duplicates_headers["HX-Push-Url"] == "/?view=duplicates&path=demo"
+
+            duplicate_search_html = http_get_text(base_url + "/partials/duplicates?q=moved")
+            assert "Returned 1 duplicate hash group." in duplicate_search_html
+            assert "moved/alpha-old.txt" in duplicate_search_html
+
+            root_duplicates_html = http_get_text(base_url + "/partials/duplicates")
+            assert "Returned 1 duplicate hash group." in root_duplicates_html
+            assert root_duplicates_html.count("<tr>") == 2
+
+            empty_scope_html = http_get_text(base_url + "/?path=empty_dupes")
+            assert "Stats scope: <span class=\"mono\">Scoped to empty_dupes</span>" in empty_scope_html
+            assert "<div class=\"stat\"><span>Files</span><strong>2</strong></div>" in empty_scope_html
+            assert "<span>Duplicate Files</span><strong>0</strong>" in empty_scope_html
+
+            empty_duplicates_html = http_get_text(base_url + "/partials/duplicates?path=empty_dupes")
+            assert "No current files with shared blob hashes matched this scope." in empty_duplicates_html
+            assert "No duplicate files matched this query." in empty_duplicates_html
+
+            empty_matching_hashes_html = http_get_text(base_url + f"/partials/files/{empty_a_file_id}/matching-hashes")
+            assert "Empty files are excluded from hash-match reporting." in empty_matching_hashes_html
 
             selected_detail_html, selected_detail_headers = http_get_text_with_headers(
                 base_url + f"/partials/files/{beta_file_id}?path=demo"
