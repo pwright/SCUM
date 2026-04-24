@@ -171,6 +171,32 @@ def path_is_within(path: Path, ancestor: Path) -> bool:
         return False
 
 
+def stored_path_value(root: Path, path: Path) -> str:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        relative_path = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return normalize_path_prefix(str(resolved_path))
+    return normalize_path_prefix(relative_path.as_posix())
+
+
+def ignore_match_path(root: Path, scan_root: Path, path: Path) -> str:
+    resolved_scan_root = scan_root.resolve()
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(root.resolve())
+    except ValueError:
+        if resolved_scan_root.is_file() and resolved_path == resolved_scan_root:
+            return normalize_path_prefix(resolved_path.name)
+        try:
+            relative_path = resolved_path.relative_to(resolved_scan_root)
+        except ValueError:
+            return stored_path_value(root, resolved_path)
+        return normalize_path_prefix(relative_path.as_posix())
+    return stored_path_value(root, resolved_path)
+
+
 def resolve_repo_context(root: Path, path_prefix: str) -> Optional[RepoContext]:
     normalized_path = normalize_path_prefix(path_prefix)
     if not normalized_path:
@@ -265,12 +291,8 @@ def load_watch_ignore_patterns(root: Path) -> list[str]:
     return patterns
 
 
-def is_ignored_watch_path(root: Path, path: Path, patterns: tuple[str, ...]) -> bool:
-    try:
-        rel_path = os.path.relpath(path, root)
-    except ValueError:
-        rel_path = str(path)
-    normalized = normalize_path_prefix(rel_path)
+def is_ignored_watch_path(root: Path, scan_root: Path, path: Path, patterns: tuple[str, ...]) -> bool:
+    normalized = ignore_match_path(root, scan_root, path)
     if normalized == DB_NAME or normalized.startswith(STORE_DIR + "/"):
         return True
     parts = normalized.split("/") if normalized else []
@@ -304,7 +326,7 @@ def scan_file_with_sysmvp(root: Path, file_path: Path) -> ActionMessage:
     )
     details = [line.strip() for line in (completed.stderr + "\n" + completed.stdout).splitlines() if line.strip()]
     detail = details[-1] if details else ""
-    display_path = normalize_path_prefix(os.path.relpath(file_path, root))
+    display_path = stored_path_value(root, file_path)
     if completed.returncode != 0:
         return ActionMessage(
             "error",
@@ -401,7 +423,7 @@ class RootWatchHandle:
             return False
         if not resolved.is_file():
             return False
-        if is_ignored_watch_path(self.repo_root, resolved, self.ignore_patterns):
+        if is_ignored_watch_path(self.repo_root, self.scan_root_path, resolved, self.ignore_patterns):
             return False
         with self._condition:
             self._pending[str(resolved)] = PendingWatchFile(
@@ -454,7 +476,7 @@ class RootWatchHandle:
             return
         if not item.path.is_file():
             return
-        if is_ignored_watch_path(self.repo_root, item.path, self.ignore_patterns):
+        if is_ignored_watch_path(self.repo_root, self.scan_root_path, item.path, self.ignore_patterns):
             return
         if stat_result.st_mtime_ns != item.observed_mtime_ns:
             with self._condition:

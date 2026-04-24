@@ -121,14 +121,20 @@ You can also scan another root while storing metadata in the current repo:
 python3 sysmvp.py scan --root ./examples/demo
 ```
 
+If the scan target is outside the repo root, SCUM stores it as an absolute path.
+That includes Windows cross-drive scans such as:
+
+```bash
+python sysmvp.py scan --root D:\photos
+```
+
 ### Scan one file
 
 ```bash
 python3 sysmvp.py scan --file ./examples/demo/a.txt
 ```
 
-Extensions are configured in `.sysextensions.json`. To enable image metadata
-extraction, set:
+Extensions are configured in `.sysextensions.json`. For example:
 
 ```json
 {
@@ -138,6 +144,11 @@ extraction, set:
     },
     "image_metadata": {
       "enabled": true
+    },
+    "pdf_preview": {
+      "dpi": 300,
+      "enabled": true,
+      "format": "png"
     }
   }
 }
@@ -161,6 +172,12 @@ scan falls back to the built-in image metadata parser so scans stay resilient.
 When `asciidoc_header` is enabled, `sysmvp.py` runs
 `extractors/asciidoc_header/run.py` for matching `.adoc` files and writes the
 resulting JSON fact to `asciidoc/header`.
+
+When `pdf_preview` is enabled, `sysmvp.py` runs
+`extractors/pdf_preview/run.py` for matching `.pdf` files, renders page images
+with `pdftoppm`, writes them under `.sysstore/pdf_preview/` by default, and
+stores a JSON summary fact at `pdf/preview`. Repo config may optionally set
+`output`, `format`, `dpi`, or `after` inside `extensions.pdf_preview`.
 
 ### List current tracked files
 
@@ -313,7 +330,7 @@ This is intentionally narrow.
 - no rename inference
 - no symlink handling
 - no directory entities yet
-- no extension-specific settings beyond enabled or disabled yet
+- no first-class validation for arbitrary extension-specific settings
 - no tags or notes commands yet
 - no parallel hashing yet
 - no live watch mode yet
@@ -333,5 +350,5 @@ Run a tiny smoke test:
 just test
 ```
 
-This runs the base scan smoke test, the dedicated image metadata extension smoke
-test, and the browser smoke test.
+This runs the base scan smoke test, the dedicated extension smoke tests, and
+the browser smoke test.

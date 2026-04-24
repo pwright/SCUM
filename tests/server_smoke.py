@@ -97,6 +97,13 @@ def main() -> int:
         gamma_path = other_dir / "c.txt"
         gamma_path.write_text("gamma\n", encoding="utf-8")
         subprocess.run(["python3", "sysmvp.py", "scan", "--root", "other"], cwd=repo_dir, check=True)
+        external_scan_dir = tmp_root / "external_scan"
+        external_scan_dir.mkdir()
+        external_file_path = external_scan_dir / "external.txt"
+        external_file_path.write_text("external\n", encoding="utf-8")
+        external_scan_root = external_scan_dir.resolve().as_posix()
+        external_file_display_path = external_file_path.resolve().as_posix()
+        subprocess.run(["python3", "sysmvp.py", "scan", "--root", external_scan_root], cwd=repo_dir, check=True)
         forget_dir = repo_dir / "forget_me"
         forget_dir.mkdir()
         forgotten_path = forget_dir / "gone.txt"
@@ -302,6 +309,26 @@ def main() -> int:
                 """
             ).fetchone()
             assert forgotten_empty_scan is None
+
+            external_file = conn.execute(
+                """
+                SELECT 1
+                FROM file_entry
+                WHERE current_path = ?
+                """,
+                (external_file_display_path,),
+            ).fetchone()
+            assert external_file is not None
+
+            external_scan = conn.execute(
+                """
+                SELECT 1
+                FROM scan_run
+                WHERE scan_root = ?
+                """,
+                (external_scan_root,),
+            ).fetchone()
+            assert external_scan is not None
 
             forgotten_blob = conn.execute(
                 """
@@ -565,6 +592,16 @@ def main() -> int:
             assert "<strong>demo</strong>" in root_scan_html
             assert "<strong>repo_git</strong>" not in root_scan_html
 
+            external_roots_html = http_get_text(
+                base_url + "/partials/roots?" + urllib.parse.urlencode({"path": external_scan_root})
+            )
+            assert external_scan_root in external_roots_html
+
+            external_files_html = http_get_text(
+                base_url + "/partials/files?" + urllib.parse.urlencode({"path": external_scan_root})
+            )
+            assert f"<strong>{external_file_display_path}</strong>" in external_files_html
+
             demo_new_path = demo_dir / "c.txt"
             demo_new_path.write_text("gamma demo\n", encoding="utf-8")
             set_mtime(demo_new_path, 1_700_000_200)
@@ -587,6 +624,42 @@ def main() -> int:
             assert "Forgot moved" in forget_action_html
             assert "No scanned non-repo roots matched this scope." in forget_action_html
             assert forget_action_headers["HX-Push-Url"] == "/?view=roots&path=moved"
+
+            external_forget_html, external_forget_headers = http_post_form_text_with_headers(
+                base_url + "/actions/root",
+                {"action": "forget", "root": external_scan_root, "path": external_scan_root},
+            )
+            assert f"Forgot {external_scan_root}" in external_forget_html
+            assert "No scanned non-repo roots matched this scope." in external_forget_html
+            assert external_forget_headers["HX-Push-Url"] == "/?view=roots&path=" + urllib.parse.quote(
+                external_scan_root,
+                safe="",
+            )
+
+            conn = sqlite3.connect(repo_dir / ".sysmvp.db")
+            conn.row_factory = sqlite3.Row
+            try:
+                forgotten_external_file = conn.execute(
+                    """
+                    SELECT 1
+                    FROM file_entry
+                    WHERE current_path = ?
+                    """,
+                    (external_file_display_path,),
+                ).fetchone()
+                assert forgotten_external_file is None
+
+                forgotten_external_scan = conn.execute(
+                    """
+                    SELECT 1
+                    FROM scan_run
+                    WHERE scan_root = ?
+                    """,
+                    (external_scan_root,),
+                ).fetchone()
+                assert forgotten_external_scan is None
+            finally:
+                conn.close()
 
             sql_query = urllib.parse.quote(
                 "SELECT current_path FROM file_entry WHERE current_path LIKE 'demo/%' ORDER BY current_path"

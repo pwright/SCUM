@@ -6,6 +6,9 @@
     "image_metadata": {
       "enabled": true
     },
+    "pdf_preview": {
+      "enabled": false
+    },
     "picasa_ini": {
       "enabled": true
     }

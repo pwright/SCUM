@@ -1,0 +1,13 @@
+{
+  "attribute": {
+    "description": "Rendered PDF page images and conversion settings",
+    "ident": "pdf/preview"
+  },
+  "entrypoint": "run.py",
+  "file_patterns": [
+    "*.pdf"
+  ],
+  "mime_prefixes": [
+    "application/pdf"
+  ]
+}

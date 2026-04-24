@@ -101,6 +101,32 @@ def normalize_rel_path(path_value: str) -> str:
     return normalized.rstrip("/")
 
 
+def stored_path_value(root: Path, path: Path) -> str:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        relative_path = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return normalize_rel_path(str(resolved_path))
+    return normalize_rel_path(relative_path.as_posix())
+
+
+def ignore_match_path(root: Path, scan_root: Path, path: Path) -> str:
+    resolved_scan_root = scan_root.resolve()
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(root.resolve())
+    except ValueError:
+        if resolved_scan_root.is_file() and resolved_path == resolved_scan_root:
+            return normalize_rel_path(resolved_path.name)
+        try:
+            relative_path = resolved_path.relative_to(resolved_scan_root)
+        except ValueError:
+            return stored_path_value(root, resolved_path)
+        return normalize_rel_path(relative_path.as_posix())
+    return stored_path_value(root, resolved_path)
+
+
 def path_matches_patterns(path_value: str, patterns: Iterable[str]) -> bool:
     normalized = path_value.replace(os.sep, "/")
     basename = Path(normalized).name
@@ -118,9 +144,9 @@ def normalize_scope_arg(root: Path, scope_value: str) -> str:
     if not raw:
         raise SystemExit("Scope must not be empty")
     candidate = Path(raw)
-    if candidate.is_absolute():
-        return normalize_rel_path(os.path.relpath(candidate.resolve(), root))
-    return normalize_rel_path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return stored_path_value(root, candidate)
 
 
 def default_extensions_config() -> dict[str, object]:
@@ -130,6 +156,9 @@ def default_extensions_config() -> dict[str, object]:
                 "enabled": False,
             },
             "image_metadata": {
+                "enabled": False,
+            },
+            "pdf_preview": {
                 "enabled": False,
             },
             "picasa_ini": {
@@ -543,15 +572,19 @@ def extractor_script_path(root: Path, extension_name: str, script_name: Path) ->
     return extension_dir_path(root, extension_name) / script_name
 
 
-def run_json_extractor(script_path: Path, file_path: Path, mime: str) -> Optional[object]:
+def run_json_extractor(root: Path, script_path: Path, file_path: Path, mime: str) -> Optional[object]:
     if not script_path.exists():
         return None
+    env = os.environ.copy()
+    env["SYSMVP_REPO_ROOT"] = str(root)
     probe = subprocess.run(
         [sys.executable, str(script_path), str(file_path), "--mime", mime],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        cwd=str(root),
+        env=env,
     )
     if probe.returncode != 0:
         stderr = probe.stderr.strip()
@@ -586,7 +619,7 @@ def extract_extension_value(
     if not extension_applies(extension_config, rel_path, mime):
         return None
     script_path = extractor_script_path(root, extension_config.name, extension_config.entrypoint)
-    extracted = run_json_extractor(script_path, file_path, mime)
+    extracted = run_json_extractor(root, script_path, file_path, mime)
     if extracted is not None:
         return extracted
     if extension_config.name == "image_metadata":
@@ -678,7 +711,7 @@ def capture_git_scan_context(root: Path, repo_root: Path) -> GitScanContext:
     requested_root_abs = repo_root.resolve()
     if repo_root_abs != requested_root_abs:
         return GitScanContext(False, None, None, None, None, {})
-    repo_root_rel = normalize_rel_path(os.path.relpath(repo_root_abs, root))
+    repo_root_rel = stored_path_value(root, repo_root_abs)
     status_probe = subprocess.run(
         ["git", "-C", str(repo_root), "status", "--porcelain=2", "--branch", "-z", "--untracked-files=all"],
         stdout=subprocess.PIPE,
@@ -872,6 +905,7 @@ def append_file_scan_git(
 def scan_file_entry(
     conn: sqlite3.Connection,
     root: Path,
+    scan_root: Path,
     file_path: Path,
     patterns: Iterable[str],
     enabled_extensions: list[ExtensionConfig],
@@ -879,10 +913,11 @@ def scan_file_entry(
     actor: str,
     active_git_ctx: Optional[GitScanContext],
 ) -> tuple[int, int]:
-    rel_to_repo = normalize_rel_path(os.path.relpath(file_path, root))
-    if is_ignored(rel_to_repo, patterns):
-        log(f"Ignoring {rel_to_repo}")
+    ignored_path = ignore_match_path(root, scan_root, file_path)
+    if is_ignored(ignored_path, patterns):
+        log(f"Ignoring {ignored_path}")
         return 0, 1
+    rel_to_repo = stored_path_value(root, file_path)
     if not file_path.is_file():
         return 0, 1
 
@@ -916,7 +951,7 @@ def scan_file_entry(
             append_fact(conn, tx_id, entity_id, extension_config.attr_ident, extracted)
     update_projection(conn, entity_id, rel_to_repo, mime, kind, blob_hash, size_bytes, mtime)
     if active_git_ctx is not None and active_git_ctx.repo_root_abs is not None:
-        repo_rel_path = normalize_rel_path(os.path.relpath(file_path, active_git_ctx.repo_root_abs))
+        repo_rel_path = stored_path_value(active_git_ctx.repo_root_abs, file_path)
         git_status = active_git_ctx.statuses.get(repo_rel_path)
         if git_status is None:
             git_status = GitFileStatus(repo_rel_path, "", "clean")
@@ -1030,7 +1065,7 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
         if scan_git_ctx.is_git_repo and scan_git_ctx.repo_root_abs is not None:
             git_ctx_cache[scan_git_ctx.repo_root_abs] = scan_git_ctx
             discovered_repo_roots.add(scan_git_ctx.repo_root_abs)
-    scan_root_rel = normalize_rel_path(os.path.relpath(scan_root, root))
+    scan_root_rel = stored_path_value(root, scan_root)
     try:
         scan_id = create_scan_run(conn, scan_root_rel, scan_git_ctx)
         if scan_git_ctx.is_git_repo:
@@ -1041,6 +1076,7 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
             scanned_delta, skipped_delta = scan_file_entry(
                 conn,
                 root,
+                scan_root,
                 scan_root,
                 patterns,
                 enabled_extensions,
@@ -1058,7 +1094,7 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
             kept_dirnames: list[str] = []
             for dirname in dirnames:
                 child_dir = current_dir / dirname
-                child_rel = normalize_rel_path(os.path.relpath(child_dir, root))
+                child_rel = ignore_match_path(root, scan_root, child_dir)
                 if is_ignored(child_rel, patterns):
                     skipped += 1
                     log(f"Ignoring {child_rel}")
@@ -1083,6 +1119,7 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
                 scanned_delta, skipped_delta = scan_file_entry(
                     conn,
                     root,
+                    scan_root,
                     file_path,
                     patterns,
                     enabled_extensions,
