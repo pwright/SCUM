@@ -869,6 +869,71 @@ def append_file_scan_git(
     )
 
 
+def scan_file_entry(
+    conn: sqlite3.Connection,
+    root: Path,
+    file_path: Path,
+    patterns: Iterable[str],
+    enabled_extensions: list[ExtensionConfig],
+    scan_id: int,
+    actor: str,
+    active_git_ctx: Optional[GitScanContext],
+) -> tuple[int, int]:
+    rel_to_repo = normalize_rel_path(os.path.relpath(file_path, root))
+    if is_ignored(rel_to_repo, patterns):
+        log(f"Ignoring {rel_to_repo}")
+        return 0, 1
+    if not file_path.is_file():
+        return 0, 1
+
+    stat_result = file_path.stat()
+    size_bytes = int(stat_result.st_size)
+    mtime = iso_mtime(stat_result)
+    mime = detect_mime(file_path)
+    kind = classify_kind(mime)
+    blob_hash = sha256_file(file_path)
+    tx_id = create_tx(conn, actor=actor, source="scan", message=f"scan {rel_to_repo}")
+    entity_id = ensure_file_entity(conn, rel_to_repo, tx_id)
+    ensure_blob_preserved(conn, root, file_path, blob_hash, size_bytes, tx_id)
+    append_fact(conn, tx_id, entity_id, "fs/path", rel_to_repo)
+    append_fact(conn, tx_id, entity_id, "fs/name", Path(rel_to_repo).name)
+    append_fact(conn, tx_id, entity_id, "fs/extension", Path(rel_to_repo).suffix.lower())
+    append_fact(conn, tx_id, entity_id, "fs/mime", mime)
+    append_fact(conn, tx_id, entity_id, "fs/kind", kind)
+    append_fact(conn, tx_id, entity_id, "fs/hash", blob_hash)
+    append_fact(conn, tx_id, entity_id, "fs/size_bytes", size_bytes)
+    append_fact(conn, tx_id, entity_id, "fs/mtime", mtime)
+    append_fact(conn, tx_id, entity_id, "fs/blob_hash", blob_hash)
+    for extension_config in enabled_extensions:
+        extracted = extract_extension_value(
+            root,
+            extension_config,
+            rel_to_repo,
+            file_path,
+            mime,
+        )
+        if extracted is not None:
+            append_fact(conn, tx_id, entity_id, extension_config.attr_ident, extracted)
+    update_projection(conn, entity_id, rel_to_repo, mime, kind, blob_hash, size_bytes, mtime)
+    if active_git_ctx is not None and active_git_ctx.repo_root_abs is not None:
+        repo_rel_path = normalize_rel_path(os.path.relpath(file_path, active_git_ctx.repo_root_abs))
+        git_status = active_git_ctx.statuses.get(repo_rel_path)
+        if git_status is None:
+            git_status = GitFileStatus(repo_rel_path, "", "clean")
+        append_file_scan_git(
+            conn,
+            scan_id,
+            entity_id,
+            active_git_ctx.git_repo_root,
+            active_git_ctx.git_branch,
+            active_git_ctx.git_head,
+            repo_rel_path,
+            git_status.git_status_raw,
+            git_status.git_state,
+        )
+    return 1, 0
+
+
 def decode_json_value(value: Optional[str]):
     if value is None:
         return None
@@ -939,7 +1004,7 @@ def resolve_active_git_root(
     return None
 
 
-def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool) -> None:
+def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, single_file: bool = False) -> None:
     ensure_repo_exists(root)
     enabled_extensions = load_enabled_extensions(root)
     if extract_meta_flag:
@@ -951,11 +1016,16 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool) 
     scanned = 0
     skipped = 0
     scan_root = scan_root.resolve()
+    if single_file:
+        if not scan_root.exists():
+            raise SystemExit(f"File not found: {scan_root}")
+        if not scan_root.is_file():
+            raise SystemExit(f"Scan target is not a file: {scan_root}")
     git_ctx_cache: dict[Path, GitScanContext] = {}
     discovered_repo_roots: set[Path] = set()
     active_repo_cache: dict[Path, Optional[Path]] = {}
     scan_git_ctx = GitScanContext(False, None, None, None, None, {})
-    if has_local_git_entry(scan_root):
+    if not single_file and has_local_git_entry(scan_root):
         scan_git_ctx = capture_git_scan_context(root, scan_root)
         if scan_git_ctx.is_git_repo and scan_git_ctx.repo_root_abs is not None:
             git_ctx_cache[scan_git_ctx.repo_root_abs] = scan_git_ctx
@@ -967,7 +1037,20 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool) 
             branch_label = scan_git_ctx.git_branch or "(detached)"
             repo_label = scan_git_ctx.git_repo_root or "."
             log(f"Git scan context: repo={repo_label} branch={branch_label}")
-        for dirpath, dirnames, filenames in os.walk(scan_root):
+        if single_file:
+            scanned_delta, skipped_delta = scan_file_entry(
+                conn,
+                root,
+                scan_root,
+                patterns,
+                enabled_extensions,
+                scan_id,
+                actor,
+                None,
+            )
+            scanned += scanned_delta
+            skipped += skipped_delta
+        for dirpath, dirnames, filenames in ([] if single_file else os.walk(scan_root)):
             current_dir = Path(dirpath).resolve()
             dirnames.sort()
             filenames.sort()
@@ -997,60 +1080,18 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool) 
 
             for filename in filenames:
                 file_path = current_dir / filename
-                rel_to_repo = normalize_rel_path(os.path.relpath(file_path, root))
-                if is_ignored(rel_to_repo, patterns):
-                    skipped += 1
-                    log(f"Ignoring {rel_to_repo}")
-                    continue
-                if not file_path.is_file():
-                    skipped += 1
-                    continue
-                stat_result = file_path.stat()
-                size_bytes = int(stat_result.st_size)
-                mtime = iso_mtime(stat_result)
-                mime = detect_mime(file_path)
-                kind = classify_kind(mime)
-                blob_hash = sha256_file(file_path)
-                tx_id = create_tx(conn, actor=actor, source="scan", message=f"scan {rel_to_repo}")
-                entity_id = ensure_file_entity(conn, rel_to_repo, tx_id)
-                ensure_blob_preserved(conn, root, file_path, blob_hash, size_bytes, tx_id)
-                append_fact(conn, tx_id, entity_id, "fs/path", rel_to_repo)
-                append_fact(conn, tx_id, entity_id, "fs/name", Path(rel_to_repo).name)
-                append_fact(conn, tx_id, entity_id, "fs/extension", Path(rel_to_repo).suffix.lower())
-                append_fact(conn, tx_id, entity_id, "fs/mime", mime)
-                append_fact(conn, tx_id, entity_id, "fs/kind", kind)
-                append_fact(conn, tx_id, entity_id, "fs/hash", blob_hash)
-                append_fact(conn, tx_id, entity_id, "fs/size_bytes", size_bytes)
-                append_fact(conn, tx_id, entity_id, "fs/mtime", mtime)
-                append_fact(conn, tx_id, entity_id, "fs/blob_hash", blob_hash)
-                for extension_config in enabled_extensions:
-                    extracted = extract_extension_value(
-                        root,
-                        extension_config,
-                        rel_to_repo,
-                        file_path,
-                        mime,
-                    )
-                    if extracted is not None:
-                        append_fact(conn, tx_id, entity_id, extension_config.attr_ident, extracted)
-                update_projection(conn, entity_id, rel_to_repo, mime, kind, blob_hash, size_bytes, mtime)
-                if active_git_ctx is not None and active_git_ctx.repo_root_abs is not None:
-                    repo_rel_path = normalize_rel_path(os.path.relpath(file_path, active_git_ctx.repo_root_abs))
-                    git_status = active_git_ctx.statuses.get(repo_rel_path)
-                    if git_status is None:
-                        git_status = GitFileStatus(repo_rel_path, "", "clean")
-                    append_file_scan_git(
-                        conn,
-                        scan_id,
-                        entity_id,
-                        active_git_ctx.git_repo_root,
-                        active_git_ctx.git_branch,
-                        active_git_ctx.git_head,
-                        repo_rel_path,
-                        git_status.git_status_raw,
-                        git_status.git_state,
-                    )
-                scanned += 1
+                scanned_delta, skipped_delta = scan_file_entry(
+                    conn,
+                    root,
+                    file_path,
+                    patterns,
+                    enabled_extensions,
+                    scan_id,
+                    actor,
+                    active_git_ctx,
+                )
+                scanned += scanned_delta
+                skipped += skipped_delta
         conn.commit()
     finally:
         conn.close()
@@ -1349,7 +1390,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Initialize repository")
 
     scan_parser = sub.add_parser("scan", help="Scan files and append facts")
-    scan_parser.add_argument("--root", default=".", help="Filesystem root to scan")
+    scan_target_group = scan_parser.add_mutually_exclusive_group()
+    scan_target_group.add_argument("--root", help="Filesystem root directory to scan")
+    scan_target_group.add_argument("--file", help="Single file to scan")
     scan_parser.add_argument(
         "--extract-meta",
         action="store_true",
@@ -1391,7 +1434,8 @@ def main() -> int:
         init_repo(root)
         return 0
     if args.command == "scan":
-        scan_repo(root, Path(args.root).resolve(), args.actor, args.extract_meta)
+        scan_target = args.file if args.file is not None else (args.root or ".")
+        scan_repo(root, Path(scan_target).resolve(), args.actor, args.extract_meta, single_file=args.file is not None)
         return 0
     if args.command == "list":
         list_files(root, args.json)

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import difflib
+import fnmatch
 import html
 import json
 import mimetypes
+import os
 import sqlite3
+import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,8 +21,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 DB_NAME = ".sysmvp.db"
 STORE_DIR = ".sysstore/objects"
 GIT_STATE_OPTIONS = ("clean", "modified", "added", "renamed", "copied", "untracked")
-VIEW_OPTIONS = ("files", "duplicates", "repos", "blobs", "tx", "sql")
+VIEW_OPTIONS = ("files", "duplicates", "repos", "roots", "blobs", "tx", "sql")
 SQL_QUERY_ROW_LIMIT = 200
+WATCH_STABILITY_WINDOW_SECONDS = 60.0
 SQL_QUERY_DEFAULT = """SELECT
   fe.current_path,
   json_extract(vcf.value_json, '$.header') AS header
@@ -27,6 +33,19 @@ JOIN attribute a ON a.attr_id = vcf.attr_id
 WHERE a.ident = 'asciidoc/header'
 ORDER BY fe.current_path
 LIMIT 50"""
+
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError as exc:  # pragma: no cover - exercised through runtime fallback
+    FileSystemEventHandler = object  # type: ignore[assignment,misc]
+    Observer = None  # type: ignore[assignment]
+    WATCHDOG_IMPORT_ERROR = str(exc)
+else:
+    WATCHDOG_IMPORT_ERROR = ""
+
+
+ROOT_WATCH_MANAGER: Optional["RootWatchManager"] = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +61,35 @@ class RepoSummary:
     scans_count: int
     files_count: int
     latest_scan_time: str
+
+
+@dataclass(frozen=True)
+class ScanRootSummary:
+    scan_root: str
+    scans_count: int
+    files_count: int
+    latest_scan_time: str
+
+
+@dataclass(frozen=True)
+class ActionMessage:
+    level: str
+    title: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class PendingWatchFile:
+    path: Path
+    observed_mtime_ns: int
+    last_event_monotonic: float
+
+
+@dataclass(frozen=True)
+class RootWatchSummary:
+    scan_root: str
+    active: bool
+    pending_files: int
 
 
 def repo_root_from(path: Path) -> Path:
@@ -97,18 +145,30 @@ def blob_abspath(root: Path, blob_hash: str) -> Path:
     return store_root(root) / blob_hash[:2] / blob_hash
 
 
-def path_is_within_repo(path_prefix: str, repo_root: str) -> bool:
+def path_is_within_prefix(path_prefix: str, candidate_prefix: str) -> bool:
     if not path_prefix:
         return False
-    if repo_root == "":
+    if candidate_prefix == "":
         return True
-    return path_prefix == repo_root or path_prefix.startswith(repo_root + "/")
+    return path_prefix == candidate_prefix or path_prefix.startswith(candidate_prefix + "/")
 
 
-def repo_matches_scope(path_prefix: str, repo_root: str) -> bool:
+def prefix_matches_scope(path_prefix: str, candidate_prefix: str) -> bool:
     if not path_prefix:
         return True
-    return path_is_within_repo(path_prefix, repo_root) or repo_root == path_prefix or repo_root.startswith(path_prefix + "/")
+    return (
+        path_is_within_prefix(path_prefix, candidate_prefix)
+        or candidate_prefix == path_prefix
+        or candidate_prefix.startswith(path_prefix + "/")
+    )
+
+
+def path_is_within(path: Path, ancestor: Path) -> bool:
+    try:
+        path.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
 
 
 def resolve_repo_context(root: Path, path_prefix: str) -> Optional[RepoContext]:
@@ -128,7 +188,7 @@ def resolve_repo_context(root: Path, path_prefix: str) -> Optional[RepoContext]:
         matching_roots = [
             str(row["git_repo_root"])
             for row in rows
-            if path_is_within_repo(normalized_path, str(row["git_repo_root"]))
+            if path_is_within_prefix(normalized_path, str(row["git_repo_root"]))
         ]
         if not matching_roots:
             return None
@@ -159,12 +219,350 @@ def normalize_branch_name(branch: str) -> str:
 def normalize_view_name(view: str) -> str:
     normalized = view.strip().lower()
     if normalized not in VIEW_OPTIONS:
-        return "files"
+        return "roots"
     return normalized
 
 
 def normalize_sql_query(query: str) -> str:
     return query.strip()
+
+
+def normalize_action_root(root_value: str) -> str:
+    return normalize_path_prefix(root_value) or "."
+
+
+def sysmvp_script_path(root: Path) -> Path:
+    repo_local = root / "sysmvp.py"
+    if repo_local.exists():
+        return repo_local
+    return Path(__file__).resolve().with_name("sysmvp.py")
+
+
+def log_browser(message: str) -> None:
+    print(f"[sysbrowse] {message}", file=sys.stderr)
+
+
+def resolve_watch_root_path(root: Path, root_value: str) -> Path:
+    raw_value = root_value.strip()
+    if not raw_value or raw_value == ".":
+        return root.resolve()
+    candidate = Path(raw_value)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (root / normalize_action_root(raw_value)).resolve()
+
+
+def load_watch_ignore_patterns(root: Path) -> list[str]:
+    ignore_path = root / ".sysignore"
+    patterns: list[str] = []
+    if not ignore_path.exists():
+        return patterns
+    for line in ignore_path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        patterns.append(value)
+    return patterns
+
+
+def is_ignored_watch_path(root: Path, path: Path, patterns: tuple[str, ...]) -> bool:
+    try:
+        rel_path = os.path.relpath(path, root)
+    except ValueError:
+        rel_path = str(path)
+    normalized = normalize_path_prefix(rel_path)
+    if normalized == DB_NAME or normalized.startswith(STORE_DIR + "/"):
+        return True
+    parts = normalized.split("/") if normalized else []
+    for pattern in patterns:
+        candidate = pattern.strip()
+        if not candidate:
+            continue
+        if candidate.endswith("/"):
+            dirname = candidate[:-1]
+            if dirname and dirname in parts:
+                return True
+            if normalized.startswith(candidate):
+                return True
+        if fnmatch.fnmatch(normalized, candidate):
+            return True
+        if fnmatch.fnmatch(Path(normalized).name, candidate):
+            return True
+    return False
+
+
+def scan_file_with_sysmvp(root: Path, file_path: Path) -> ActionMessage:
+    script_path = sysmvp_script_path(root)
+    command = [sys.executable, str(script_path), "scan", "--file", str(file_path)]
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    details = [line.strip() for line in (completed.stderr + "\n" + completed.stdout).splitlines() if line.strip()]
+    detail = details[-1] if details else ""
+    display_path = normalize_path_prefix(os.path.relpath(file_path, root))
+    if completed.returncode != 0:
+        return ActionMessage(
+            "error",
+            f"Watch scan failed for {display_path or file_path.name}",
+            detail or f"scan exited with code {completed.returncode}",
+        )
+    return ActionMessage("success", f"Scanned {display_path or file_path.name}", detail or "Command completed.")
+
+
+class RootWatchEventHandler(FileSystemEventHandler):
+    def __init__(self, handle: "RootWatchHandle") -> None:
+        self.handle = handle
+
+    def on_created(self, event) -> None:  # pragma: no cover - exercised via watchdog runtime
+        if not getattr(event, "is_directory", False):
+            self.handle.record_path_change(Path(event.src_path))
+
+    def on_modified(self, event) -> None:  # pragma: no cover - exercised via watchdog runtime
+        if not getattr(event, "is_directory", False):
+            self.handle.record_path_change(Path(event.src_path))
+
+    def on_moved(self, event) -> None:  # pragma: no cover - exercised via watchdog runtime
+        if getattr(event, "is_directory", False):
+            return
+        destination = getattr(event, "dest_path", "")
+        if destination:
+            self.handle.record_path_change(Path(destination))
+
+
+class RootWatchHandle:
+    def __init__(
+        self,
+        repo_root: Path,
+        scan_root: str,
+        stability_window_seconds: float = WATCH_STABILITY_WINDOW_SECONDS,
+    ) -> None:
+        self.repo_root = repo_root
+        self.scan_root = normalize_action_root(scan_root)
+        self.scan_root_path = resolve_watch_root_path(repo_root, scan_root)
+        self.stability_window_seconds = stability_window_seconds
+        self.ignore_patterns = tuple(load_watch_ignore_patterns(repo_root))
+        self._condition = threading.Condition()
+        self._pending: dict[str, PendingWatchFile] = {}
+        self._observer = None
+        self._worker = threading.Thread(
+            target=self._run_worker,
+            name=f"scum-watch:{self.scan_root or '.'}",
+            daemon=True,
+        )
+        self._stop_requested = False
+
+    def start(self) -> None:
+        if Observer is None:
+            raise RuntimeError("watchdog is not installed")
+        if not self.scan_root_path.exists():
+            raise FileNotFoundError(f"Root not found: {self.scan_root_path}")
+        if not self.scan_root_path.is_dir():
+            raise NotADirectoryError(f"Watch root is not a directory: {self.scan_root_path}")
+        self._observer = Observer()
+        self._observer.schedule(RootWatchEventHandler(self), str(self.scan_root_path), recursive=True)
+        self._observer.start()
+        self._worker.start()
+        log_browser(f"Watching {self.scan_root or '.'} with a {int(self.stability_window_seconds)}s stability window")
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join(timeout=5)
+        if self._worker.is_alive():
+            self._worker.join(timeout=5)
+        log_browser(f"Stopped watching {self.scan_root or '.'}")
+
+    def summary(self) -> RootWatchSummary:
+        with self._condition:
+            return RootWatchSummary(
+                scan_root=self.scan_root,
+                active=self._observer is not None and self._observer.is_alive(),
+                pending_files=len(self._pending),
+            )
+
+    def record_path_change(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        if not path_is_within(resolved, self.scan_root_path):
+            return False
+        try:
+            stat_result = resolved.stat()
+        except OSError:
+            return False
+        if not resolved.is_file():
+            return False
+        if is_ignored_watch_path(self.repo_root, resolved, self.ignore_patterns):
+            return False
+        with self._condition:
+            self._pending[str(resolved)] = PendingWatchFile(
+                path=resolved,
+                observed_mtime_ns=stat_result.st_mtime_ns,
+                last_event_monotonic=time.monotonic(),
+            )
+            self._condition.notify_all()
+        return True
+
+    def process_due_files_once(self, now: Optional[float] = None) -> int:
+        current_time = time.monotonic() if now is None else now
+        due_items: list[PendingWatchFile] = []
+        with self._condition:
+            for key, item in list(self._pending.items()):
+                if item.last_event_monotonic + self.stability_window_seconds <= current_time:
+                    due_items.append(item)
+                    del self._pending[key]
+        processed = 0
+        for item in due_items:
+            self._process_due_file(item)
+            processed += 1
+        return processed
+
+    def _run_worker(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stop_requested and not self._pending:
+                    self._condition.wait()
+                if self._stop_requested:
+                    return
+                next_ready = min(
+                    item.last_event_monotonic + self.stability_window_seconds
+                    for item in self._pending.values()
+                )
+                timeout = max(0.0, next_ready - time.monotonic())
+            if timeout > 0:
+                with self._condition:
+                    if self._stop_requested:
+                        return
+                    self._condition.wait(timeout)
+                    if self._stop_requested:
+                        return
+            self.process_due_files_once()
+
+    def _process_due_file(self, item: PendingWatchFile) -> None:
+        try:
+            stat_result = item.path.stat()
+        except OSError:
+            return
+        if not item.path.is_file():
+            return
+        if is_ignored_watch_path(self.repo_root, item.path, self.ignore_patterns):
+            return
+        if stat_result.st_mtime_ns != item.observed_mtime_ns:
+            with self._condition:
+                existing = self._pending.get(str(item.path))
+                if existing is None or existing.last_event_monotonic <= item.last_event_monotonic:
+                    self._pending[str(item.path)] = PendingWatchFile(
+                        path=item.path,
+                        observed_mtime_ns=stat_result.st_mtime_ns,
+                        last_event_monotonic=time.monotonic(),
+                    )
+                    self._condition.notify_all()
+            return
+        result = scan_file_with_sysmvp(self.repo_root, item.path)
+        if result.level == "error":
+            log_browser(result.detail or result.title)
+
+
+class RootWatchManager:
+    def __init__(self, repo_root: Path, stability_window_seconds: float = WATCH_STABILITY_WINDOW_SECONDS) -> None:
+        self.repo_root = repo_root
+        self.stability_window_seconds = stability_window_seconds
+        self._lock = threading.Lock()
+        self._handles: dict[str, RootWatchHandle] = {}
+
+    def availability_detail(self) -> str:
+        if Observer is not None:
+            return (
+                f"Changed files are scanned with `--file` after "
+                f"{int(self.stability_window_seconds)} seconds without further edits."
+            )
+        return (
+            "Live watch requires the `watchdog` package. "
+            "Install it with `python3 -m pip install watchdog` to enable the checkbox."
+        )
+
+    def snapshot(self) -> dict[str, RootWatchSummary]:
+        with self._lock:
+            return {scan_root: handle.summary() for scan_root, handle in self._handles.items()}
+
+    def set_enabled(self, scan_root: str, enabled: bool) -> ActionMessage:
+        normalized_root = normalize_action_root(scan_root)
+        if enabled:
+            if Observer is None:
+                return ActionMessage(
+                    "error",
+                    f"Could not watch {normalized_root}",
+                    self.availability_detail(),
+                )
+            with self._lock:
+                existing = self._handles.get(normalized_root)
+                if existing is not None and existing.summary().active:
+                    return ActionMessage(
+                        "success",
+                        f"Watching {normalized_root}",
+                        self.availability_detail(),
+                    )
+            handle = RootWatchHandle(
+                repo_root=self.repo_root,
+                scan_root=normalized_root,
+                stability_window_seconds=self.stability_window_seconds,
+            )
+            try:
+                handle.start()
+            except Exception as exc:
+                return ActionMessage("error", f"Could not watch {normalized_root}", str(exc))
+            with self._lock:
+                self._handles[normalized_root] = handle
+            return ActionMessage("success", f"Watching {normalized_root}", self.availability_detail())
+
+        with self._lock:
+            handle = self._handles.pop(normalized_root, None)
+        if handle is not None:
+            handle.stop()
+        return ActionMessage("success", f"Stopped watching {normalized_root}", "")
+
+    def stop_all(self) -> None:
+        with self._lock:
+            handles = list(self._handles.values())
+            self._handles.clear()
+        for handle in handles:
+            handle.stop()
+
+
+def run_sysmvp_action(root: Path, action: str, root_value: str) -> ActionMessage:
+    normalized_root = normalize_action_root(root_value)
+    script_path = sysmvp_script_path(root)
+    if action == "scan":
+        command = [sys.executable, str(script_path), "scan", "--root", normalized_root]
+        title = f"Scanned {normalized_root}"
+    elif action == "forget":
+        command = [sys.executable, str(script_path), "forget-root", normalized_root]
+        title = f"Forgot {normalized_root}"
+    else:
+        return ActionMessage("error", "Unknown action", f"Unsupported root action: {action}")
+
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    details = [line.strip() for line in (completed.stderr + "\n" + completed.stdout).splitlines() if line.strip()]
+    detail = details[-1] if details else ""
+    if completed.returncode != 0:
+        return ActionMessage("error", f"{title} failed", detail or f"{action} exited with code {completed.returncode}")
+    return ActionMessage("success", title, detail or "Command completed.")
 
 
 def is_select_sql(query: str) -> bool:
@@ -403,12 +801,80 @@ def fetch_repo_summaries(root: Path, path_prefix: str) -> list[RepoSummary]:
     summaries: list[RepoSummary] = []
     for row in summary_rows:
         repo_root = str(row["git_repo_root"])
-        if not repo_matches_scope(normalized_path, repo_root):
+        if not prefix_matches_scope(normalized_path, repo_root):
             continue
         summaries.append(
             RepoSummary(
                 repo_root=repo_root,
                 branches=tuple(branches_by_repo.get(repo_root, [])),
+                scans_count=int(row["scans_count"]),
+                files_count=int(row["files_count"]),
+                latest_scan_time=str(row["latest_scan_time"]),
+            )
+        )
+    return summaries
+
+
+def fetch_non_repo_root_summaries(root: Path, path_prefix: str) -> list[ScanRootSummary]:
+    normalized_path = normalize_path_prefix(path_prefix)
+    conn = connect_db(root)
+    try:
+        rows = conn.execute(
+            """
+            WITH normalized_scan_run AS (
+                SELECT
+                    COALESCE(NULLIF(scan_root, '.'), '') AS normalized_scan_root,
+                    scan_id,
+                    scan_time,
+                    is_git_repo
+                FROM scan_run
+            ),
+            latest_root_state AS (
+                SELECT normalized_scan_root, is_git_repo
+                FROM (
+                    SELECT
+                        normalized_scan_root,
+                        is_git_repo,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY normalized_scan_root
+                            ORDER BY scan_time DESC, scan_id DESC
+                        ) AS rn
+                    FROM normalized_scan_run
+                )
+                WHERE rn = 1
+            )
+            SELECT
+                nsr.normalized_scan_root AS scan_root,
+                COUNT(*) AS scans_count,
+                COALESCE(MAX(nsr.scan_time), '') AS latest_scan_time,
+                (
+                    SELECT COUNT(*)
+                    FROM file_entry fe
+                    WHERE fe.is_deleted = 0
+                      AND (
+                            nsr.normalized_scan_root = ''
+                            OR COALESCE(fe.current_path, fe.canonical_uri) = nsr.normalized_scan_root
+                            OR COALESCE(fe.current_path, fe.canonical_uri) LIKE nsr.normalized_scan_root || '/%'
+                      )
+                ) AS files_count
+            FROM normalized_scan_run nsr
+            JOIN latest_root_state lrs ON lrs.normalized_scan_root = nsr.normalized_scan_root
+            WHERE lrs.is_git_repo = 0
+            GROUP BY nsr.normalized_scan_root
+            ORDER BY nsr.normalized_scan_root COLLATE NOCASE
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    summaries: list[ScanRootSummary] = []
+    for row in rows:
+        scan_root = str(row["scan_root"])
+        if not prefix_matches_scope(normalized_path, scan_root):
+            continue
+        summaries.append(
+            ScanRootSummary(
+                scan_root=scan_root,
                 scans_count=int(row["scans_count"]),
                 files_count=int(row["files_count"]),
                 latest_scan_time=str(row["latest_scan_time"]),
@@ -516,7 +982,10 @@ def fetch_files(root: Path, query: str, path_prefix: str, branch: str, git_state
                     OR lower(COALESCE(current_path, canonical_uri)) = ?
                     OR lower(COALESCE(current_path, canonical_uri)) LIKE ?
                   )
-            ORDER BY fe.file_id
+            ORDER BY
+                COALESCE(fe.current_mtime, '') DESC,
+                lower(COALESCE(fe.current_path, fe.canonical_uri)) COLLATE NOCASE,
+                fe.file_id DESC
             """,
             cte_params
             + ((active_git_state,) if active_git_state else ())
@@ -1181,6 +1650,44 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
       color: var(--muted);
       font-weight: 600;
     }}
+    .detail-disclosure {{
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.45);
+      overflow: hidden;
+    }}
+    .detail-disclosure summary {{
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      cursor: pointer;
+      padding: 12px 14px;
+      font-weight: 600;
+      color: var(--accent);
+      user-select: none;
+    }}
+    .detail-disclosure summary:hover {{
+      background: rgba(49, 100, 232, 0.05);
+    }}
+    .detail-disclosure summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .detail-disclosure .label-open {{
+      display: none;
+    }}
+    .detail-disclosure[open] .label-closed {{
+      display: none;
+    }}
+    .detail-disclosure[open] .label-open {{
+      display: inline;
+    }}
+    .disclosure-body {{
+      padding: 0 14px 14px;
+    }}
+    .detail-disclosure .meta {{
+      margin-top: 0;
+    }}
     .mono {{
       font-family: var(--mono);
       word-break: break-all;
@@ -1236,6 +1743,63 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
       background: #fff0f0;
       border-color: #efc6c6;
     }}
+    .notice {{
+      border: 1px solid #cfe2cf;
+      background: #f2fbf2;
+      color: #255c2f;
+    }}
+    .notice strong {{
+      display: block;
+      margin-bottom: 4px;
+    }}
+    .notice.error {{
+      color: #a12c2c;
+      background: #fff0f0;
+      border-color: #efc6c6;
+    }}
+    .root-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .root-watch {{
+      display: inline-flex;
+      align-items: center;
+    }}
+    .watch-toggle {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink);
+      font-weight: 600;
+      white-space: nowrap;
+    }}
+    .watch-toggle input {{
+      width: 1rem;
+      height: 1rem;
+      margin: 0;
+      accent-color: var(--accent);
+    }}
+    .watch-status {{
+      color: var(--muted);
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }}
+    .root-actions button {{
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font: inherit;
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    .root-actions .danger {{
+      border-color: #d99a9a;
+      color: #8a2424;
+      background: #fff6f6;
+    }}
     @media (max-width: 980px) {{
       .hero, .split, .stats {{
         grid-template-columns: 1fr;
@@ -1255,9 +1819,10 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
         <p class="subtitle">Browse the current database state, inspect immutable fact history, and jump straight to preserved blob bytes.</p>
         {render_path_filter(root, initial_path, initial_branch, initial_git_state)}
         <div class="nav">
+          {nav_button("roots", initial_view)}
+          {nav_button("repos", initial_view)}
           {nav_button("files", initial_view)}
           {nav_button("duplicates", initial_view)}
-          {nav_button("repos", initial_view)}
           {nav_button("blobs", initial_view)}
           {nav_button("tx", initial_view)}
           {nav_button("sql", initial_view)}
@@ -1267,6 +1832,40 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
     </section>
     <section id="content" class="panel content">{initial_content}</section>
   </div>
+  <script>
+    (() => {{
+      const storagePrefix = "scum:";
+
+      function bindPersistentDisclosures(root) {{
+        root.querySelectorAll("details[data-pref-key]").forEach((element) => {{
+          const storageKey = storagePrefix + element.dataset.prefKey;
+          try {{
+            const stored = window.localStorage.getItem(storageKey);
+            if (stored === "open") {{
+              element.open = true;
+            }} else if (stored === "closed") {{
+              element.open = false;
+            }}
+          }} catch (_error) {{
+          }}
+
+          if (element.dataset.prefBound === "1") {{
+            return;
+          }}
+          element.addEventListener("toggle", () => {{
+            try {{
+              window.localStorage.setItem(storageKey, element.open ? "open" : "closed");
+            }} catch (_error) {{
+            }}
+          }});
+          element.dataset.prefBound = "1";
+        }});
+      }}
+
+      document.addEventListener("DOMContentLoaded", () => bindPersistentDisclosures(document));
+      document.addEventListener("htmx:afterSwap", (event) => bindPersistentDisclosures(event.target));
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -1274,7 +1873,15 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
 
 
 def nav_button(name: str, active: str) -> str:
-    labels = {"files": "Files", "duplicates": "Duplicates", "repos": "Repos", "blobs": "Blobs", "tx": "Transactions", "sql": "SQL"}
+    labels = {
+        "roots": "Roots",
+        "repos": "Repos",
+        "files": "Files",
+        "duplicates": "Duplicates",
+        "blobs": "Blobs",
+        "tx": "Transactions",
+        "sql": "SQL",
+    }
     active_class = "active" if name == active else ""
     return (
         f'<button class="{active_class}" hx-get="/partials/{name}" '
@@ -1488,19 +2095,26 @@ def render_file_detail(root: Path, file_id: int, path_prefix: str, branch: str) 
   <div class="card">
     <h2>{h(file_row["current_path"] or file_row["canonical_uri"])}</h2>
     <table class="meta">
-      <tr><td>File ID</td><td class="mono">{h(file_row["file_id"])}</td></tr>
-      <tr><td>Canonical URI</td><td class="mono">{h(file_row["canonical_uri"])}</td></tr>
-      <tr><td>Name</td><td>{h(file_row["current_name"])}</td></tr>
-      <tr><td>Extension</td><td>{h(file_row["current_extension"] or "-")}</td></tr>
-      <tr><td>MIME</td><td>{h(file_row["current_mime"] or "-")}</td></tr>
-      <tr><td>Kind</td><td>{h(file_row["current_kind"] or "-")}</td></tr>
-      <tr><td>Size</td><td>{fmt_bytes(file_row["current_size_bytes"])}</td></tr>
       <tr><td>Modified</td><td>{h(file_row["current_mtime"] or "-")}</td></tr>
-      <tr><td>Blob hash</td><td class="mono">{h(blob_hash or "-")}</td></tr>
-      <tr><td>Blob path</td><td class="mono">{h(file_row["storage_relpath"] or "-")}</td></tr>
-      <tr><td>Blob</td><td>{blob_link}</td></tr>
-      {branch_rows}
     </table>
+    <details class="detail-disclosure">
+      <summary><span class="label-closed">Show Details</span><span class="label-open">Hide Details</span></summary>
+      <div class="disclosure-body">
+        <table class="meta">
+        <tr><td>File ID</td><td class="mono">{h(file_row["file_id"])}</td></tr>
+        <tr><td>Canonical URI</td><td class="mono">{h(file_row["canonical_uri"])}</td></tr>
+        <tr><td>Name</td><td>{h(file_row["current_name"])}</td></tr>
+        <tr><td>Extension</td><td>{h(file_row["current_extension"] or "-")}</td></tr>
+        <tr><td>MIME</td><td>{h(file_row["current_mime"] or "-")}</td></tr>
+        <tr><td>Kind</td><td>{h(file_row["current_kind"] or "-")}</td></tr>
+        <tr><td>Size</td><td>{fmt_bytes(file_row["current_size_bytes"])}</td></tr>
+        <tr><td>Blob hash</td><td class="mono">{h(blob_hash or "-")}</td></tr>
+        <tr><td>Blob path</td><td class="mono">{h(file_row["storage_relpath"] or "-")}</td></tr>
+        <tr><td>Blob</td><td>{blob_link}</td></tr>
+        {branch_rows}
+      </table>
+      </div>
+    </details>
   </div>
   <div id="blob-preview-panel">{preview}</div>
   <div class="card">
@@ -1557,53 +2171,37 @@ def render_blob_preview(root: Path, blob_hash: str, kind: Optional[str], mime: O
     blob_url = f"/blob/{quote(blob_hash)}"
 
     if mime and mime.startswith("image/"):
-        return f"""
-<div class="card">
-  <h3>Blob Preview</h3>
-  <img src="{blob_url}" alt="Blob preview" style="max-width: 100%; height: auto; border-radius: 12px;">
-</div>
-"""
-
-    if mime and mime.startswith("audio/"):
-        return f"""
-<div class="card">
-  <h3>Blob Preview</h3>
-  <audio controls preload="metadata" src="{blob_url}" style="width: 100%;"></audio>
-</div>
-"""
-
-    if mime and mime.startswith("video/"):
-        return f"""
-<div class="card">
-  <h3>Blob Preview</h3>
-  <video controls preload="metadata" src="{blob_url}" style="width: 100%; max-height: 32rem; border-radius: 12px;"></video>
-</div>
-"""
-
-    if mime == "application/pdf":
-        return f"""
-<div class="card">
-  <h3>Blob Preview</h3>
-  <iframe src="{blob_url}" title="Blob preview" style="width: 100%; min-height: 32rem; border: 0; border-radius: 12px;"></iframe>
-</div>
-"""
-
-    if kind == "text" or is_probably_text(path):
+        preview_body = f'<img src="{blob_url}" alt="Blob preview" style="max-width: 100%; height: auto; border-radius: 12px;">'
+    elif mime and mime.startswith("audio/"):
+        preview_body = f'<audio controls preload="metadata" src="{blob_url}" style="width: 100%;"></audio>'
+    elif mime and mime.startswith("video/"):
+        preview_body = f'<video controls preload="metadata" src="{blob_url}" style="width: 100%; max-height: 32rem; border-radius: 12px;"></video>'
+    elif mime == "application/pdf":
+        preview_body = (
+            f'<iframe src="{blob_url}" title="Blob preview" '
+            f'style="width: 100%; min-height: 32rem; border: 0; border-radius: 12px;"></iframe>'
+        )
+    elif kind == "text" or is_probably_text(path):
         text = read_text_blob(path, limit=4096)
         if text is None:
             return ""
         suffix = "\n…" if path.stat().st_size > len(text.encode("utf-8", errors="ignore")) else ""
-        return f"""
-<div class="card">
-  <h3>Blob Preview</h3>
-  <pre class="code-block">{h(text)}{suffix}</pre>
-</div>
-"""
+        preview_body = f'<pre class="code-block">{h(text)}{suffix}</pre>'
+    else:
+        preview_body = (
+            f'<p class="subtitle">No inline preview for this blob type. '
+            f'Use <a href="{blob_url}" target="_blank" rel="noreferrer">open raw blob</a>.</p>'
+        )
 
     return f"""
 <div class="card">
   <h3>Blob Preview</h3>
-  <p class="subtitle">No inline preview for this blob type. Use <a href="{blob_url}" target="_blank" rel="noreferrer">open raw blob</a>.</p>
+  <details class="detail-disclosure" data-pref-key="blob-preview-visible" open>
+    <summary><span class="label-closed">Show Blob Preview</span><span class="label-open">Hide Blob Preview</span></summary>
+    <div class="disclosure-body">
+      {preview_body}
+    </div>
+  </details>
 </div>
 """
 
@@ -1884,6 +2482,66 @@ def render_repos_partial(root: Path, path_prefix: str) -> str:
 """
 
 
+def render_roots_partial(root: Path, path_prefix: str, message: Optional[ActionMessage] = None) -> str:
+    rows = fetch_non_repo_root_summaries(root, path_prefix)
+    notice = render_action_notice(message)
+    watch_manager = ROOT_WATCH_MANAGER
+    watch_summaries = watch_manager.snapshot() if watch_manager is not None else {}
+    watch_detail = (
+        watch_manager.availability_detail()
+        if watch_manager is not None
+        else "Changed files are scanned after a 60 second stability window."
+    )
+    def watch_summary(scan_root: str) -> RootWatchSummary:
+        return watch_summaries.get(scan_root, RootWatchSummary(scan_root, False, 0))
+    if rows:
+        body = "".join(
+            f"""
+<tr>
+  <th class="mono">
+    <button
+      class="repo-link"
+      hx-get="/partials/files?path={quote(row.scan_root or '.')}"
+      hx-target="#content"
+      hx-swap="innerHTML"
+    ><strong>{h(row.scan_root or '.')}</strong></button>
+  </th>
+  <td>{row.files_count}</td>
+  <td>{row.scans_count}</td>
+  <td>{h(row.latest_scan_time or '-')}</td>
+  <td>
+    <form class="root-watch" hx-post="/actions/root-watch" hx-trigger="change" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+      <input type="hidden" name="root" value="{h(row.scan_root or '.')}">
+      <label class="watch-toggle">
+        <input type="checkbox" name="enabled" value="1"{" checked" if watch_summary(row.scan_root or ".").active else ""}>
+        <span>Watch</span>
+      </label>
+    </form>
+    <div class="watch-status">{h(f"{watch_summary(row.scan_root or '.').pending_files} pending" if watch_summary(row.scan_root or '.').active else "off")}</div>
+  </td>
+  <td>
+    <form class="root-actions" hx-post="/actions/root" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+      <input type="hidden" name="root" value="{h(row.scan_root or '.')}">
+      <button type="submit" name="action" value="scan">Scan</button>
+      <button type="submit" class="danger" name="action" value="forget" hx-confirm="Forget all tracked data for {h(row.scan_root or '.')}?">Forget</button>
+    </form>
+  </td>
+</tr>
+"""
+            for row in rows
+        )
+        table = "<table><thead><tr><th>Scan Root</th><th>Files</th><th>Scans</th><th>Latest Scan</th><th>Watch</th><th>Actions</th></tr></thead><tbody>" + body + "</tbody></table>"
+    else:
+        table = empty_state("No scanned non-repo roots matched this scope.")
+    return f"""
+<div class="stack">
+  {notice}
+  <p class="subtitle">{h(watch_detail)}</p>
+  <div class="card">{table}</div>
+</div>
+"""
+
+
 def render_tx_partial(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> str:
     rows = fetch_transactions(root, query, path_prefix, branch, git_state)
     if rows:
@@ -1997,9 +2655,31 @@ def empty_state(message: str) -> str:
     return f'<div class="empty">{h(message)}</div>'
 
 
+def render_action_notice(message: Optional[ActionMessage]) -> str:
+    if message is None:
+        return ""
+    level_class = " error" if message.level == "error" else ""
+    detail_html = f"<p>{h(message.detail)}</p>" if message.detail else ""
+    return (
+        f'<div class="card notice{level_class}">'
+        f"<strong>{h(message.title)}</strong>"
+        f"{detail_html}"
+        "</div>"
+    )
+
+
 def parse_query(handler: BaseHTTPRequestHandler) -> tuple[str, dict[str, list[str]]]:
     parsed = urlparse(handler.path)
     return parsed.path, parse_qs(parsed.query)
+
+
+def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
+    try:
+        content_length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        content_length = 0
+    payload = handler.rfile.read(content_length).decode("utf-8")
+    return parse_qs(payload)
 
 
 def query_value(query: dict[str, list[str]], key: str) -> str:
@@ -2025,6 +2705,8 @@ def render_root_content(
 ) -> str:
     if view == "repos":
         return render_repos_partial(root, path_prefix)
+    if view == "roots":
+        return render_roots_partial(root, path_prefix)
     if view == "duplicates":
         return render_duplicates_partial(root, query, path_prefix, branch, git_state)
     if view == "blobs":
@@ -2073,6 +2755,13 @@ class BrowserHandler(BaseHTTPRequestHandler):
             self.respond_html(
                 render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
                 headers={"HX-Push-Url": build_browser_url("repos", path_prefix, branch, git_state)},
+            )
+            return
+        if path == "/partials/roots":
+            content = render_roots_partial(self.repo_root, path_prefix)
+            self.respond_html(
+                render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
+                headers={"HX-Push-Url": build_browser_url("roots", path_prefix, branch, git_state)},
             )
             return
         if path == "/partials/duplicates":
@@ -2155,6 +2844,74 @@ class BrowserHandler(BaseHTTPRequestHandler):
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
+    def do_POST(self) -> None:  # noqa: N802
+        path, _ = parse_query(self)
+        form = parse_form(self)
+        path_prefix = query_value(form, "path")
+        branch = query_value(form, "branch")
+        git_state = query_value(form, "git_state")
+        if path == "/actions/root-watch":
+            root_value = query_value(form, "root")
+            if not root_value:
+                self.respond_html(
+                    render_partial_response(
+                        self.repo_root,
+                        path_prefix,
+                        branch,
+                        git_state,
+                        render_roots_partial(
+                            self.repo_root,
+                            path_prefix,
+                            ActionMessage("error", "Watch action failed", "Missing root."),
+                        ),
+                    ),
+                    status=HTTPStatus.OK,
+                    headers={"HX-Push-Url": build_browser_url("roots", path_prefix, branch, git_state)},
+                )
+                return
+            enabled = query_value(form, "enabled") == "1"
+            manager = ROOT_WATCH_MANAGER
+            if manager is None:
+                message = ActionMessage("error", "Watch action failed", "Watch manager is not available.")
+            else:
+                message = manager.set_enabled(root_value, enabled)
+            content = render_roots_partial(self.repo_root, path_prefix, message)
+            self.respond_html(
+                render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
+                status=HTTPStatus.OK,
+                headers={"HX-Push-Url": build_browser_url("roots", path_prefix, branch, git_state)},
+            )
+            return
+        if path == "/actions/root":
+            action = query_value(form, "action")
+            root_value = query_value(form, "root")
+            if not root_value:
+                self.respond_html(
+                    render_partial_response(
+                        self.repo_root,
+                        path_prefix,
+                        branch,
+                        git_state,
+                        render_roots_partial(
+                            self.repo_root,
+                            path_prefix,
+                            ActionMessage("error", "Root action failed", "Missing root."),
+                        ),
+                    ),
+                    status=HTTPStatus.OK,
+                    headers={"HX-Push-Url": build_browser_url("roots", path_prefix, branch, git_state)},
+                )
+                return
+            message = run_sysmvp_action(self.repo_root, action, root_value)
+            content = render_roots_partial(self.repo_root, path_prefix, message)
+            self.respond_html(
+                render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
+                status=HTTPStatus.OK,
+                headers={"HX-Push-Url": build_browser_url("roots", path_prefix, branch, git_state)},
+            )
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
     def respond_html(
         self,
         body: str,
@@ -2208,19 +2965,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    global ROOT_WATCH_MANAGER
     parser = build_parser()
     args = parser.parse_args()
     root = repo_root_from(Path(args.repo))
     ensure_repo_exists(root)
+    ROOT_WATCH_MANAGER = RootWatchManager(root)
 
     handler_cls = type("ConfiguredBrowserHandler", (BrowserHandler,), {"repo_root": root})
     with ThreadingHTTPServer((args.host, args.port), handler_cls) as httpd:
         host, port = httpd.server_address
-        print(f"Serving SCUM browser at http://{host}:{port}", file=sys.stderr)
+        log_browser(f"Serving SCUM browser at http://{host}:{port}")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             return 0
+        finally:
+            if ROOT_WATCH_MANAGER is not None:
+                ROOT_WATCH_MANAGER.stop_all()
     return 0
 
 

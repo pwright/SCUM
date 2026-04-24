@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
+import importlib.util
+import os
 import sqlite3
 import shutil
 import subprocess
@@ -11,6 +13,10 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+def set_mtime(path: Path, timestamp: int) -> None:
+    os.utime(path, (timestamp, timestamp))
 
 
 def wait_for_server_url(handle: subprocess.Popen[str]) -> str:
@@ -29,6 +35,14 @@ def http_get_text(url: str) -> str:
 
 def http_get_text_with_headers(url: str) -> tuple[str, dict[str, str]]:
     with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode("utf-8"), dict(response.headers.items())
+
+
+def http_post_form_text_with_headers(url: str, form: dict[str, str]) -> tuple[str, dict[str, str]]:
+    payload = urllib.parse.urlencode(form).encode("utf-8")
+    request = urllib.request.Request(url, data=payload, method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(request, timeout=5) as response:
         return response.read().decode("utf-8"), dict(response.headers.items())
 
 
@@ -58,6 +72,8 @@ def main() -> int:
         beta_path = demo_dir / "b.txt"
         alpha_path.write_text("alpha\n", encoding="utf-8")
         beta_path.write_text("beta\n", encoding="utf-8")
+        set_mtime(alpha_path, 1_700_000_000)
+        set_mtime(beta_path, 1_700_000_100)
         subprocess.run(["python3", "sysmvp.py", "scan", "--root", "demo"], cwd=repo_dir, check=True)
         dupes_dir = repo_dir / "dupes"
         dupes_dir.mkdir()
@@ -353,7 +369,13 @@ def main() -> int:
             assert "<span>Duplicate Files</span><strong>1</strong>" in index_html
             assert "<div class=\"stat\"><span>Blobs</span><strong>2</strong></div>" in index_html
             assert "<div class=\"stat\"><span>Transactions</span><strong>2</strong></div>" in index_html
-            assert "demo/a.txt" in index_html
+            assert "<strong>demo</strong>" in index_html
+            assert "Scan Root" in index_html
+            assert 'class="active"' in index_html
+            assert ">Roots</button>" in index_html
+            assert ">Repos</button>" in index_html
+            assert ">Files</button>" in index_html
+            assert index_html.index(">Roots</button>") < index_html.index(">Repos</button>") < index_html.index(">Files</button>")
             assert 'value="demo"' in index_html
             assert 'list="path-suggestions"' in index_html
             assert 'hx-get="/partials/path-suggestions"' in index_html
@@ -366,6 +388,9 @@ def main() -> int:
             assert "<div class=\"stat\"><span>Files</span><strong>2</strong></div>" in files_partial_html
             assert "<span>Duplicate Files</span><strong>1</strong>" in files_partial_html
             assert files_partial_headers["HX-Push-Url"] == "/?view=files&path=demo"
+            assert files_partial_html.index("<strong>demo/b.txt</strong>") < files_partial_html.index("<strong>demo/a.txt</strong>")
+            assert 'localStorage.setItem(storageKey, element.open ? "open" : "closed")' in index_html
+            assert 'querySelectorAll("details[data-pref-key]")' in index_html
 
             suggestion_html = http_get_text(base_url + "/partials/path-suggestions?path=de")
             assert '<option value="demo"></option>' in suggestion_html
@@ -379,6 +404,11 @@ def main() -> int:
             assert "Find matching hashes" in detail_html
             assert "alpha" in detail_html
             assert blob_hash in detail_html
+            assert "<span class=\"label-closed\">Show Details</span><span class=\"label-open\">Hide Details</span>" in detail_html
+            assert detail_html.index("<td>Modified</td>") < detail_html.index("<summary><span class=\"label-closed\">Show Details</span>")
+            assert detail_html.index("<summary><span class=\"label-closed\">Show Details</span>") < detail_html.index("<td>File ID</td>")
+            assert 'data-pref-key="blob-preview-visible"' in detail_html
+            assert "<span class=\"label-closed\">Show Blob Preview</span><span class=\"label-open\">Hide Blob Preview</span>" in detail_html
 
             matching_hashes_html = http_get_text(base_url + "/partials/files/1/matching-hashes")
             assert "Showing every transaction where this blob hash was observed." in matching_hashes_html
@@ -510,14 +540,63 @@ def main() -> int:
             assert '<option value="dev"' in nested_repo_html
             assert '<option value="main"' not in nested_repo_html
 
+            roots_html, roots_headers = http_get_text_with_headers(base_url + "/partials/roots?path=parent_git")
+            assert "parent_git/inside_scan" in roots_html
+            assert "repo_git" not in roots_html
+            assert 'hx-get="/partials/files?path=parent_git/inside_scan"' in roots_html
+            assert 'hx-post="/actions/root"' in roots_html
+            assert 'hx-post="/actions/root-watch"' in roots_html
+            assert '<input type="checkbox" name="enabled" value="1"' in roots_html
+            assert '>Scan</button>' in roots_html
+            assert '>Forget</button>' in roots_html
+            assert roots_headers["HX-Push-Url"] == "/?view=roots&path=parent_git"
+
+            if importlib.util.find_spec("watchdog") is None:
+                watch_action_html, watch_action_headers = http_post_form_text_with_headers(
+                    base_url + "/actions/root-watch",
+                    {"root": "demo", "enabled": "1", "path": "demo"},
+                )
+                assert "Could not watch demo" in watch_action_html
+                assert "Install it with `python3 -m pip install watchdog` to enable the checkbox." in watch_action_html
+                assert watch_action_headers["HX-Push-Url"] == "/?view=roots&path=demo"
+
+            root_scan_html = http_get_text(base_url + "/?view=roots&path=demo")
+            assert "Scan Root" in root_scan_html
+            assert "<strong>demo</strong>" in root_scan_html
+            assert "<strong>repo_git</strong>" not in root_scan_html
+
+            demo_new_path = demo_dir / "c.txt"
+            demo_new_path.write_text("gamma demo\n", encoding="utf-8")
+            set_mtime(demo_new_path, 1_700_000_200)
+            scan_action_html, scan_action_headers = http_post_form_text_with_headers(
+                base_url + "/actions/root",
+                {"action": "scan", "root": "demo", "path": "demo"},
+            )
+            assert "Scanned demo" in scan_action_html
+            assert "<div class=\"stat\"><span>Files</span><strong>3</strong></div>" in scan_action_html
+            assert scan_action_headers["HX-Push-Url"] == "/?view=roots&path=demo"
+
+            rescanned_files_html = http_get_text(base_url + "/partials/files?path=demo")
+            assert "<strong>demo/c.txt</strong>" in rescanned_files_html
+            assert rescanned_files_html.index("<strong>demo/c.txt</strong>") < rescanned_files_html.index("<strong>demo/b.txt</strong>")
+
+            forget_action_html, forget_action_headers = http_post_form_text_with_headers(
+                base_url + "/actions/root",
+                {"action": "forget", "root": "moved", "path": "moved"},
+            )
+            assert "Forgot moved" in forget_action_html
+            assert "No scanned non-repo roots matched this scope." in forget_action_html
+            assert forget_action_headers["HX-Push-Url"] == "/?view=roots&path=moved"
+
             sql_query = urllib.parse.quote(
                 "SELECT current_path FROM file_entry WHERE current_path LIKE 'demo/%' ORDER BY current_path"
             )
             sql_html, sql_headers = http_get_text_with_headers(base_url + f"/partials/sql?sql={sql_query}&path=demo")
             assert "Run Query" in sql_html
-            assert "Returned 2 rows." in sql_html
+            assert "Returned 3 rows." in sql_html
             assert "demo/a.txt" in sql_html
             assert "demo/b.txt" in sql_html
+            assert "demo/c.txt" in sql_html
             assert "other/c.txt" not in sql_html
             assert 'href="/?view=files&amp;path=demo&amp;file=1"' in sql_html
             assert 'href="/?view=files&amp;path=demo&amp;file=2"' in sql_html

@@ -66,6 +66,34 @@ No server. No daemon. No extra infrastructure.
 └── justfile
 ```
 
+## Install
+
+Use a local virtual environment, especially if your system Python is externally
+managed:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+SCUM itself does not require any third-party packages for basic scanning and
+browsing.
+
+To enable live root watching in the browser UI, install `watchdog` into the
+virtual environment:
+
+```bash
+python -m pip install watchdog
+```
+
+Then run commands with the venv interpreter, for example:
+
+```bash
+python sysmvp.py init
+python sysbrowse.py
+```
+
 ## Commands
 
 ### Initialize
@@ -91,6 +119,12 @@ You can also scan another root while storing metadata in the current repo:
 
 ```bash
 python3 sysmvp.py scan --root ./examples/demo
+```
+
+### Scan one file
+
+```bash
+python3 sysmvp.py scan --file ./examples/demo/a.txt
 ```
 
 Extensions are configured in `.sysextensions.json`. To enable image metadata
@@ -155,6 +189,8 @@ The browser UI provides:
 - a files view backed by `file_entry`
 - a blobs view backed by `blob_object`
 - a transactions view backed by `tx`
+- a non-repo scan roots view backed by `scan_run`
+- scan and forget actions directly from the roots view
 - a global repo-path prefix filter such as `examples/demo`
 - stats that follow the active path filter
 - version history for a file with links to older preserved blobs
@@ -254,6 +290,7 @@ mkdir -p examples/demo
 printf 'hello\n' > examples/demo/a.txt
 printf 'world\n' > examples/demo/b.txt
 python3 sysmvp.py scan --root examples/demo
+python3 sysmvp.py scan --file examples/demo/a.txt
 python3 sysmvp.py list
 python3 sysmvp.py history 1
 ```
