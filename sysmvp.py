@@ -17,11 +17,14 @@ from typing import Iterable, Optional
 
 DB_NAME = ".sysmvp.db"
 STORE_DIR = ".sysstore/objects"
+SCAN_STATE_DIR = ".sysstore/scan_resume"
 SCHEMA_FILE = "schema.sql"
 IGNORE_FILE = ".sysignore"
 EXTENSIONS_FILE = ".sysextensions.json"
 EXTRACTORS_DIR = "extractors"
 EXTENSION_MANIFEST = "extension.json"
+SCAN_RESUME_VERSION = 1
+SCAN_DIR_TX_SOURCE = "scan-dir"
 XMP_NS = {
     "dc": "http://purl.org/dc/elements/1.1/",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -55,6 +58,22 @@ class ExtensionConfig:
     attr_description: str
 
 
+@dataclass(frozen=True)
+class ScanStatePaths:
+    session_dir: Path
+    session_file: Path
+    events_file: Path
+    trackers_dir: Path
+
+
+@dataclass(frozen=True)
+class ScanSession:
+    scan_id: int
+    scan_root: str
+    signature: str
+    paths: ScanStatePaths
+
+
 def log(message: str) -> None:
     print(f"[sysmvp] {message}", file=sys.stderr)
 
@@ -75,6 +94,10 @@ def store_root(root: Path) -> Path:
     return root / STORE_DIR
 
 
+def scan_state_root(root: Path) -> Path:
+    return root / SCAN_STATE_DIR
+
+
 def connect_db(root: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path(root)))
     conn.row_factory = sqlite3.Row
@@ -90,6 +113,35 @@ def ensure_repo_exists(root: Path) -> None:
 def read_text_file(path: Path) -> str:
     with path.open("r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def stable_json_dumps(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def load_json_file(path: Path, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"Failed to read {label}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{label} must contain a JSON object")
+    return payload
+
+
+def append_event_log(path: Path, event: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(stable_json_dumps(event) + "\n")
 
 
 def normalize_rel_path(path_value: str) -> str:
@@ -301,6 +353,148 @@ def load_enabled_extensions(root: Path) -> list[ExtensionConfig]:
         if config is not None:
             configs.append(config)
     return configs
+
+
+def scan_signature(
+    root: Path,
+    scan_root: str,
+    extract_meta_flag: bool,
+    patterns: Iterable[str],
+) -> str:
+    payload = {
+        "version": SCAN_RESUME_VERSION,
+        "scan_root": scan_root,
+        "extract_meta_flag": bool(extract_meta_flag),
+        "ignore_patterns": list(patterns),
+        "extensions_config": read_extensions_config(root),
+    }
+    return hashlib.sha256(stable_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def scan_state_paths(root: Path, scan_root: str) -> ScanStatePaths:
+    session_key = hashlib.sha256(scan_root.encode("utf-8")).hexdigest()[:16]
+    session_dir = scan_state_root(root) / session_key
+    return ScanStatePaths(
+        session_dir=session_dir,
+        session_file=session_dir / "session.json",
+        events_file=session_dir / "events.ndjson",
+        trackers_dir=session_dir / "dirs",
+    )
+
+
+def tracker_file_name(dir_path: str) -> str:
+    return hashlib.sha256(dir_path.encode("utf-8")).hexdigest()[:24] + ".json"
+
+
+def tracker_path(paths: ScanStatePaths, dir_path: str) -> Path:
+    return paths.trackers_dir / tracker_file_name(dir_path)
+
+
+def load_tracker(paths: ScanStatePaths, dir_path: str) -> Optional[dict[str, object]]:
+    path = tracker_path(paths, dir_path)
+    if not path.exists():
+        return None
+    return load_json_file(path, f"scan tracker for {dir_path}")
+
+
+def write_tracker(paths: ScanStatePaths, dir_path: str, payload: dict[str, object]) -> None:
+    write_json_atomic(tracker_path(paths, dir_path), payload)
+
+
+def reset_scan_state(paths: ScanStatePaths) -> None:
+    if paths.session_dir.exists():
+        shutil.rmtree(paths.session_dir)
+
+
+def update_scan_session(session: ScanSession, status: str, **extra: object) -> None:
+    payload: dict[str, object] = {
+        "version": SCAN_RESUME_VERSION,
+        "scan_id": session.scan_id,
+        "scan_root": session.scan_root,
+        "signature": session.signature,
+        "status": status,
+        "updated_at": utc_now(),
+    }
+    if not session.paths.session_file.exists():
+        payload["created_at"] = payload["updated_at"]
+    else:
+        previous = load_json_file(session.paths.session_file, "scan session")
+        payload["created_at"] = previous.get("created_at", payload["updated_at"])
+    payload.update(extra)
+    write_json_atomic(session.paths.session_file, payload)
+
+
+def log_scan_event(session: ScanSession, event: str, **extra: object) -> None:
+    payload: dict[str, object] = {
+        "time": utc_now(),
+        "event": event,
+        "scan_id": session.scan_id,
+        "scan_root": session.scan_root,
+    }
+    payload.update(extra)
+    append_event_log(session.paths.events_file, payload)
+
+
+def directory_run_id(signature: str, dir_path: str, attempt: int) -> str:
+    seed = f"{signature}:{dir_path}:{attempt}:{utc_now()}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def scan_dir_marker_message(dir_path: str, dir_run_id_value: str) -> str:
+    return f"{dir_path}|{dir_run_id_value}"
+
+
+def directory_run_committed(conn: sqlite3.Connection, dir_path: str, dir_run_id_value: str) -> bool:
+    if not dir_run_id_value:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM tx WHERE source = ? AND message = ? LIMIT 1",
+        (SCAN_DIR_TX_SOURCE, scan_dir_marker_message(dir_path, dir_run_id_value)),
+    ).fetchone()
+    return row is not None
+
+
+def create_scan_dir_marker(conn: sqlite3.Connection, actor: str, dir_path: str, dir_run_id_value: str) -> None:
+    create_tx(
+        conn,
+        actor=actor,
+        source=SCAN_DIR_TX_SOURCE,
+        message=scan_dir_marker_message(dir_path, dir_run_id_value),
+    )
+
+
+def start_scan_session(
+    conn: sqlite3.Connection,
+    root: Path,
+    scan_root: str,
+    scan_git_ctx: GitScanContext,
+    signature: str,
+    resume: bool,
+    resume_reset: bool,
+) -> ScanSession:
+    paths = scan_state_paths(root, scan_root)
+    if resume_reset or not resume:
+        reset_scan_state(paths)
+    paths.trackers_dir.mkdir(parents=True, exist_ok=True)
+
+    existing: Optional[dict[str, object]] = None
+    if paths.session_file.exists():
+        existing = load_json_file(paths.session_file, "scan session")
+        if existing.get("signature") != signature:
+            raise SystemExit(
+                f"Resume state for {scan_root} does not match current scan settings. Use --resume-reset to start over."
+            )
+        scan_id = int(existing.get("scan_id", 0))
+        if scan_id <= 0:
+            raise SystemExit(f"Invalid scan_id in resume state for {scan_root}")
+    else:
+        scan_id = create_scan_run(conn, scan_root, scan_git_ctx)
+        conn.commit()
+
+    session = ScanSession(scan_id=scan_id, scan_root=scan_root, signature=signature, paths=paths)
+    update_scan_session(session, "active")
+    log_scan_event(session, "scan_resume" if existing is not None else "scan_start", resume=bool(existing))
+    return session
 
 
 def mime_matches_prefixes(mime: str, prefixes: Iterable[str]) -> bool:
@@ -969,6 +1163,92 @@ def scan_file_entry(
     return 1, 0
 
 
+def process_scan_directory(
+    conn: sqlite3.Connection,
+    root: Path,
+    scan_root: Path,
+    current_dir: Path,
+    filenames: Iterable[str],
+    patterns: Iterable[str],
+    enabled_extensions: list[ExtensionConfig],
+    session: ScanSession,
+    actor: str,
+    active_git_ctx: Optional[GitScanContext],
+    resume: bool,
+) -> tuple[int, int]:
+    filenames = list(filenames)
+    dir_path = stored_path_value(root, current_dir) or "."
+    tracker = load_tracker(session.paths, dir_path)
+    if tracker is not None and tracker.get("signature") != session.signature:
+        raise SystemExit(f"Resume tracker for {dir_path} does not match current scan settings")
+
+    if tracker is not None and directory_run_committed(conn, dir_path, str(tracker.get("dir_run_id", ""))):
+        if tracker.get("status") != "done":
+            done_tracker = dict(tracker)
+            done_tracker["status"] = "done"
+            done_tracker["completed_at"] = utc_now()
+            done_tracker["error"] = None
+            write_tracker(session.paths, dir_path, done_tracker)
+            log_scan_event(session, "dir_recovered", dir=dir_path, attempt=done_tracker.get("attempt", 0))
+        if resume:
+            log(f"Resume skip {dir_path}")
+            log_scan_event(session, "dir_skip_done", dir=dir_path)
+            return 0, 0
+
+    attempt = int(tracker.get("attempt", 0)) + 1 if tracker is not None else 1
+    dir_run_id_value = directory_run_id(session.signature, dir_path, attempt)
+    active_tracker = {
+        "dir": dir_path,
+        "attempt": attempt,
+        "status": "active",
+        "signature": session.signature,
+        "dir_run_id": dir_run_id_value,
+        "started_at": utc_now(),
+        "completed_at": None,
+        "error": None,
+    }
+    write_tracker(session.paths, dir_path, active_tracker)
+    log_scan_event(session, "dir_start", dir=dir_path, attempt=attempt, file_count=len(filenames))
+
+    scanned = 0
+    skipped = 0
+    try:
+        conn.execute("BEGIN")
+        create_scan_dir_marker(conn, actor, dir_path, dir_run_id_value)
+        for filename in filenames:
+            file_path = current_dir / filename
+            scanned_delta, skipped_delta = scan_file_entry(
+                conn,
+                root,
+                scan_root,
+                file_path,
+                patterns,
+                enabled_extensions,
+                session.scan_id,
+                actor,
+                active_git_ctx,
+            )
+            scanned += scanned_delta
+            skipped += skipped_delta
+        conn.commit()
+    except BaseException as exc:
+        conn.rollback()
+        failed_tracker = dict(active_tracker)
+        failed_tracker["status"] = "failed"
+        failed_tracker["completed_at"] = utc_now()
+        failed_tracker["error"] = str(exc)
+        write_tracker(session.paths, dir_path, failed_tracker)
+        log_scan_event(session, "dir_fail", dir=dir_path, attempt=attempt, error=str(exc))
+        raise
+
+    done_tracker = dict(active_tracker)
+    done_tracker["status"] = "done"
+    done_tracker["completed_at"] = utc_now()
+    write_tracker(session.paths, dir_path, done_tracker)
+    log_scan_event(session, "dir_commit", dir=dir_path, attempt=attempt, scanned=scanned, skipped=skipped)
+    return scanned, skipped
+
+
 def decode_json_value(value: Optional[str]):
     if value is None:
         return None
@@ -1039,8 +1319,18 @@ def resolve_active_git_root(
     return None
 
 
-def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, single_file: bool = False) -> None:
+def scan_repo(
+    root: Path,
+    scan_root: Path,
+    actor: str,
+    extract_meta_flag: bool,
+    single_file: bool = False,
+    resume: bool = False,
+    resume_reset: bool = False,
+) -> None:
     ensure_repo_exists(root)
+    if single_file and (resume or resume_reset):
+        raise SystemExit("--resume and --resume-reset are only supported with --root scans")
     enabled_extensions = load_enabled_extensions(root)
     if extract_meta_flag:
         log(f"--extract-meta is deprecated; configure {EXTENSIONS_FILE} instead")
@@ -1048,6 +1338,7 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
     conn = connect_db(root)
     seed_attributes(conn, 0)
     ensure_extension_attributes(conn, enabled_extensions)
+    conn.commit()
     scanned = 0
     skipped = 0
     scan_root = scan_root.resolve()
@@ -1065,14 +1356,12 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
         if scan_git_ctx.is_git_repo and scan_git_ctx.repo_root_abs is not None:
             git_ctx_cache[scan_git_ctx.repo_root_abs] = scan_git_ctx
             discovered_repo_roots.add(scan_git_ctx.repo_root_abs)
-    scan_root_rel = stored_path_value(root, scan_root)
+    scan_root_rel = stored_path_value(root, scan_root) or "."
+    session: Optional[ScanSession] = None
+    completed = False
     try:
-        scan_id = create_scan_run(conn, scan_root_rel, scan_git_ctx)
-        if scan_git_ctx.is_git_repo:
-            branch_label = scan_git_ctx.git_branch or "(detached)"
-            repo_label = scan_git_ctx.git_repo_root or "."
-            log(f"Git scan context: repo={repo_label} branch={branch_label}")
         if single_file:
+            scan_id = create_scan_run(conn, scan_root_rel, scan_git_ctx)
             scanned_delta, skipped_delta = scan_file_entry(
                 conn,
                 root,
@@ -1086,51 +1375,75 @@ def scan_repo(root: Path, scan_root: Path, actor: str, extract_meta_flag: bool, 
             )
             scanned += scanned_delta
             skipped += skipped_delta
-        for dirpath, dirnames, filenames in ([] if single_file else os.walk(scan_root)):
-            current_dir = Path(dirpath).resolve()
-            dirnames.sort()
-            filenames.sort()
+            conn.commit()
+        else:
+            session = start_scan_session(
+                conn,
+                root,
+                scan_root_rel,
+                scan_git_ctx,
+                scan_signature(root, scan_root_rel, extract_meta_flag, patterns),
+                resume=resume,
+                resume_reset=resume_reset,
+            )
+            if scan_git_ctx.is_git_repo:
+                branch_label = scan_git_ctx.git_branch or "(detached)"
+                repo_label = scan_git_ctx.git_repo_root or "."
+                log(f"Git scan context: repo={repo_label} branch={branch_label}")
+            for dirpath, dirnames, filenames in os.walk(scan_root):
+                current_dir = Path(dirpath).resolve()
+                dirnames.sort()
+                filenames.sort()
 
-            kept_dirnames: list[str] = []
-            for dirname in dirnames:
-                child_dir = current_dir / dirname
-                child_rel = ignore_match_path(root, scan_root, child_dir)
-                if is_ignored(child_rel, patterns):
-                    skipped += 1
-                    log(f"Ignoring {child_rel}")
-                    continue
-                kept_dirnames.append(dirname)
-            dirnames[:] = kept_dirnames
+                kept_dirnames: list[str] = []
+                for dirname in dirnames:
+                    child_dir = current_dir / dirname
+                    child_rel = ignore_match_path(root, scan_root, child_dir)
+                    if is_ignored(child_rel, patterns):
+                        skipped += 1
+                        log(f"Ignoring {child_rel}")
+                        if session is not None:
+                            log_scan_event(session, "dir_ignore", dir=child_rel)
+                        continue
+                    kept_dirnames.append(dirname)
+                dirnames[:] = kept_dirnames
 
-            if has_local_git_entry(current_dir) and current_dir not in git_ctx_cache:
-                git_ctx = capture_git_scan_context(root, current_dir)
-                if git_ctx.is_git_repo and git_ctx.repo_root_abs is not None:
-                    git_ctx_cache[git_ctx.repo_root_abs] = git_ctx
-                    discovered_repo_roots.add(git_ctx.repo_root_abs)
-                    branch_label = git_ctx.git_branch or "(detached)"
-                    repo_label = git_ctx.git_repo_root or "."
-                    log(f"Discovered nested git repo: repo={repo_label} branch={branch_label}")
+                if has_local_git_entry(current_dir) and current_dir not in git_ctx_cache:
+                    git_ctx = capture_git_scan_context(root, current_dir)
+                    if git_ctx.is_git_repo and git_ctx.repo_root_abs is not None:
+                        git_ctx_cache[git_ctx.repo_root_abs] = git_ctx
+                        discovered_repo_roots.add(git_ctx.repo_root_abs)
+                        branch_label = git_ctx.git_branch or "(detached)"
+                        repo_label = git_ctx.git_repo_root or "."
+                        log(f"Discovered nested git repo: repo={repo_label} branch={branch_label}")
 
-            active_repo_root = resolve_active_git_root(current_dir, scan_root, discovered_repo_roots, active_repo_cache)
-            active_git_ctx = git_ctx_cache.get(active_repo_root) if active_repo_root is not None else None
-
-            for filename in filenames:
-                file_path = current_dir / filename
-                scanned_delta, skipped_delta = scan_file_entry(
+                active_repo_root = resolve_active_git_root(current_dir, scan_root, discovered_repo_roots, active_repo_cache)
+                active_git_ctx = git_ctx_cache.get(active_repo_root) if active_repo_root is not None else None
+                scanned_delta, skipped_delta = process_scan_directory(
                     conn,
                     root,
                     scan_root,
-                    file_path,
+                    current_dir,
+                    filenames,
                     patterns,
                     enabled_extensions,
-                    scan_id,
+                    session,
                     actor,
                     active_git_ctx,
+                    resume=resume,
                 )
                 scanned += scanned_delta
                 skipped += skipped_delta
-        conn.commit()
+        completed = True
+    except BaseException as exc:
+        if session is not None:
+            update_scan_session(session, "failed", scanned=scanned, skipped=skipped, error=str(exc))
+            log_scan_event(session, "scan_failed", scanned=scanned, skipped=skipped, error=str(exc))
+        raise
     finally:
+        if session is not None and completed:
+            update_scan_session(session, "completed", scanned=scanned, skipped=skipped)
+            log_scan_event(session, "scan_complete", scanned=scanned, skipped=skipped)
         conn.close()
     log(f"Scan complete: scanned={scanned} skipped={skipped}")
 
@@ -1435,6 +1748,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"Deprecated compatibility flag; extensions are configured in {EXTENSIONS_FILE}",
     )
+    scan_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a prior directory-level scan for this root using .sysstore/scan_resume trackers",
+    )
+    scan_parser.add_argument(
+        "--resume-reset",
+        action="store_true",
+        help="Discard any existing resume trackers for this root before scanning",
+    )
 
     list_parser = sub.add_parser("list", help="List current tracked files")
     list_parser.add_argument("--json", action="store_true", help="Emit JSON")
@@ -1472,7 +1795,15 @@ def main() -> int:
         return 0
     if args.command == "scan":
         scan_target = args.file if args.file is not None else (args.root or ".")
-        scan_repo(root, Path(scan_target).resolve(), args.actor, args.extract_meta, single_file=args.file is not None)
+        scan_repo(
+            root,
+            Path(scan_target).resolve(),
+            args.actor,
+            args.extract_meta,
+            single_file=args.file is not None,
+            resume=args.resume,
+            resume_reset=args.resume_reset,
+        )
         return 0
     if args.command == "list":
         list_files(root, args.json)

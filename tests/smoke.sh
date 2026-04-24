@@ -33,6 +33,8 @@ python3 tests/image_metadata_extension_smoke.py >/tmp/image-extension-smoke.out 
 cat /tmp/image-extension-smoke.out >&2
 python3 tests/pdf_preview_extension_smoke.py >/tmp/pdf-preview-extension-smoke.out 2>/tmp/pdf-preview-extension-smoke.err
 cat /tmp/pdf-preview-extension-smoke.out >&2
+python3 tests/resume_scan_smoke.py >/tmp/resume-scan-smoke.out 2>/tmp/resume-scan-smoke.err
+cat /tmp/resume-scan-smoke.out >&2
 python3 tests/root_watch_smoke.py >/tmp/root-watch-smoke.out 2>/tmp/root-watch-smoke.err
 cat /tmp/root-watch-smoke.out >&2
 python3 tests/server_smoke.py >/tmp/sysbrowse-smoke.out 2>/tmp/sysbrowse-smoke.err

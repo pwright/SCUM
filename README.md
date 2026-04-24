@@ -121,6 +121,27 @@ You can also scan another root while storing metadata in the current repo:
 python3 sysmvp.py scan --root ./examples/demo
 ```
 
+Long-running root scans now keep directory-level progress trackers and an event
+log under `.sysstore/scan_resume/`. Each walked directory is committed to
+SQLite independently, so a later resume can skip directories that already
+committed.
+
+Resume an interrupted scan for the same root:
+
+```bash
+python3 sysmvp.py scan --root ./examples/demo --resume
+```
+
+Discard old resume state for that root and start over:
+
+```bash
+python3 sysmvp.py scan --root ./examples/demo --resume-reset
+```
+
+Resume state is keyed by scan root and current scan settings. If `.sysignore`
+or `.sysextensions.json` changed since the interrupted run, `--resume` refuses
+to continue until you run with `--resume-reset`.
+
 If the scan target is outside the repo root, SCUM stores it as an absolute path.
 That includes Windows cross-drive scans such as:
 
@@ -178,6 +199,11 @@ When `pdf_preview` is enabled, `sysmvp.py` runs
 with `pdftoppm`, writes them under `.sysstore/pdf_preview/` by default, and
 stores a JSON summary fact at `pdf/preview`. Repo config may optionally set
 `output`, `format`, `dpi`, or `after` inside `extensions.pdf_preview`.
+
+Resume guarantees apply to SQLite state and scan bookkeeping, not every file
+write under `.sysstore`. Blob copies and extractor outputs are still best-effort
+filesystem side effects, so a crash can leave unreferenced files behind even
+when the database rolls back that directory.
 
 ### List current tracked files
 
