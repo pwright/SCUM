@@ -49,6 +49,8 @@ python3 tests/write_tree_smoke.py >/tmp/write-tree-smoke.out 2>/tmp/write-tree-s
 cat /tmp/write-tree-smoke.out >&2
 python3 tests/tree_browser_smoke.py >/tmp/tree-browser-smoke.out 2>/tmp/tree-browser-smoke.err
 cat /tmp/tree-browser-smoke.out >&2
+python3 tests/regex_search_smoke.py >/tmp/regex-search-smoke.out 2>/tmp/regex-search-smoke.err
+cat /tmp/regex-search-smoke.out >&2
 python3 tests/root_watch_smoke.py >/tmp/root-watch-smoke.out 2>/tmp/root-watch-smoke.err
 cat /tmp/root-watch-smoke.out >&2
 python3 tests/server_smoke.py >/tmp/sysbrowse-smoke.out 2>/tmp/sysbrowse-smoke.err

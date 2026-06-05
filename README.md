@@ -279,6 +279,7 @@ The browser UI provides:
 - scan and forget actions directly from the roots view
 - a global repo-path prefix filter such as `examples/demo`
 - stats that follow the active path filter
+- text or regex mode for file, blob, duplicate, and transaction search
 - version history for a file with links to older preserved blobs
 - file detail with immutable fact history
 - direct links to preserved blob bytes under `.sysstore/objects/...`

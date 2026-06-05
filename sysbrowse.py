@@ -6,6 +6,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -15,15 +16,17 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 DB_NAME = ".sysmvp.db"
 STORE_DIR = ".sysstore/objects"
 GIT_STATE_OPTIONS = ("clean", "modified", "added", "renamed", "copied", "untracked")
 VIEW_OPTIONS = ("files", "duplicates", "repos", "roots", "blobs", "tx", "sql")
+SEARCH_MODE_OPTIONS = ("text", "regex")
 SQL_QUERY_ROW_LIMIT = 200
 WATCH_STABILITY_WINDOW_SECONDS = 60.0
+CONTENT_SYNC_ATTR = 'hx-sync="#content:replace"'
 SQL_QUERY_DEFAULT = """SELECT
   fe.current_path,
   json_extract(vcf.value_json, '$.header') AS header
@@ -98,6 +101,17 @@ class RootWatchSummary:
     scan_root: str
     active: bool
     pending_files: int
+
+
+@dataclass(frozen=True)
+class SearchSpec:
+    query: str
+    mode: str
+    pattern: Optional[re.Pattern[str]]
+
+
+class SearchPatternError(ValueError):
+    pass
 
 
 def repo_root_from(path: Path) -> Path:
@@ -259,6 +273,47 @@ def normalize_view_name(view: str) -> str:
 
 def normalize_sql_query(query: str) -> str:
     return query.strip()
+
+
+def normalize_search_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized in SEARCH_MODE_OPTIONS:
+        return normalized
+    return "text"
+
+
+def prepare_search_spec(query: str, mode: str) -> SearchSpec:
+    normalized_query = query.strip()
+    normalized_mode = normalize_search_mode(mode)
+    if normalized_mode != "regex" or not normalized_query:
+        return SearchSpec(normalized_query, normalized_mode, None)
+    try:
+        pattern = re.compile(normalized_query, re.IGNORECASE)
+    except re.error as exc:
+        raise SearchPatternError(str(exc)) from exc
+    return SearchSpec(normalized_query, normalized_mode, pattern)
+
+
+def attach_search_function(conn: sqlite3.Connection, search_spec: SearchSpec) -> None:
+    if search_spec.pattern is None:
+        return
+
+    def regexp_match(value: object) -> int:
+        return 1 if search_spec.pattern and search_spec.pattern.search("" if value is None else str(value)) else 0
+
+    conn.create_function("regexp", 1, regexp_match)
+
+
+def search_condition(search_spec: SearchSpec, fields: Iterable[str]) -> tuple[str, tuple[object, ...]]:
+    field_list = list(fields)
+    if not search_spec.query or not field_list:
+        return "1 = 1", ()
+    if search_spec.mode == "regex":
+        checks = " OR ".join(f"regexp({field})" for field in field_list)
+        return checks, ()
+    like = f"%{search_spec.query.lower()}%"
+    checks = " OR ".join(f"lower(COALESCE({field}, '')) LIKE ?" for field in field_list)
+    return checks, tuple(like for _ in field_list)
 
 
 def normalize_action_root(root_value: str) -> str:
@@ -1040,8 +1095,26 @@ def fetch_path_suggestions(root: Path, path_prefix: str, limit: int = 20) -> lis
     return ordered[:limit]
 
 
-def fetch_files(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
-    like = f"%{query.lower()}%"
+def fetch_files(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
+    search_spec = prepare_search_spec(query, search_mode)
+    file_search_sql, file_search_params = search_condition(
+        search_spec,
+        (
+            "COALESCE(current_path, canonical_uri)",
+            "current_mime",
+            "current_kind",
+            "current_hash",
+        ),
+    )
+    fact_search_sql, fact_search_params = search_condition(
+        search_spec,
+        (
+            "vcf.value_text",
+            "CAST(vcf.value_int AS TEXT)",
+            "vcf.value_json",
+            "vcf.value_blobref",
+        ),
+    )
     normalized_path = normalize_path_prefix(path_prefix).lower()
     path_like = f"{normalized_path}/%" if normalized_path else ""
     repo_ctx, active_branch = resolve_active_branch(root, path_prefix, branch)
@@ -1058,6 +1131,7 @@ def fetch_files(root: Path, query: str, path_prefix: str, branch: str, git_state
         if active_git_state:
             git_state_filter = "AND bs.git_state = ?"
     conn = connect_db(root)
+    attach_search_function(conn, search_spec)
     try:
         return conn.execute(
             f"""
@@ -1076,21 +1150,12 @@ def fetch_files(root: Path, query: str, path_prefix: str, branch: str, git_state
             WHERE is_deleted = 0
               {git_state_filter}
               AND (
-                    ? = ''
-                    OR lower(COALESCE(current_path, canonical_uri)) LIKE ?
-                    OR lower(COALESCE(current_mime, '')) LIKE ?
-                    OR lower(COALESCE(current_kind, '')) LIKE ?
-                    OR lower(COALESCE(current_hash, '')) LIKE ?
+                    {file_search_sql}
                     OR EXISTS (
                         SELECT 1
                         FROM v_current_fact vcf
                         WHERE vcf.entity_id = fe.file_id
-                          AND (
-                                lower(COALESCE(vcf.value_text, '')) LIKE ?
-                                OR lower(COALESCE(CAST(vcf.value_int AS TEXT), '')) LIKE ?
-                                OR lower(COALESCE(vcf.value_json, '')) LIKE ?
-                                OR lower(COALESCE(vcf.value_blobref, '')) LIKE ?
-                              )
+                          AND ({fact_search_sql})
                     )
               )
               AND (
@@ -1105,7 +1170,9 @@ def fetch_files(root: Path, query: str, path_prefix: str, branch: str, git_state
             """,
             cte_params
             + ((active_git_state,) if active_git_state else ())
-            + (query, like, like, like, like, like, like, like, like, normalized_path, normalized_path, path_like),
+            + file_search_params
+            + fact_search_params
+            + (normalized_path, normalized_path, path_like),
         ).fetchall()
     finally:
         conn.close()
@@ -1236,8 +1303,12 @@ def fetch_matching_hash_rows(root: Path, file_id: int) -> tuple[Optional[sqlite3
         conn.close()
 
 
-def fetch_blobs(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
-    like = f"%{query.lower()}%"
+def fetch_blobs(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
+    search_spec = prepare_search_spec(query, search_mode)
+    blob_search_sql, blob_search_params = search_condition(
+        search_spec,
+        ("blob_hash", "storage_relpath"),
+    )
     normalized_path = normalize_path_prefix(path_prefix).lower()
     path_like = f"{normalized_path}/%" if normalized_path else ""
     repo_ctx, active_branch = resolve_active_branch(root, path_prefix, branch)
@@ -1252,17 +1323,14 @@ def fetch_blobs(root: Path, query: str, path_prefix: str, branch: str, git_state
         if active_git_state:
             exists_state_filter = "AND bs.git_state = ?"
     conn = connect_db(root)
+    attach_search_function(conn, search_spec)
     try:
         return conn.execute(
             f"""
             {cte}
             SELECT blob_hash, algo, size_bytes, storage_relpath, created_tx_id
             FROM blob_object
-            WHERE (
-                    ? = ''
-                    OR lower(blob_hash) LIKE ?
-                    OR lower(storage_relpath) LIKE ?
-                  )
+            WHERE ({blob_search_sql})
               AND (
                     ? = ''
                     OR EXISTS (
@@ -1283,14 +1351,19 @@ def fetch_blobs(root: Path, query: str, path_prefix: str, branch: str, git_state
             """,
             cte_params
             + ((active_git_state,) if active_git_state else ())
-            + (query, like, like, normalized_path, normalized_path, path_like),
+            + blob_search_params
+            + (normalized_path, normalized_path, path_like),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_duplicate_files(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
-    like = f"%{query.lower()}%"
+def fetch_duplicate_files(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
+    search_spec = prepare_search_spec(query, search_mode)
+    duplicate_search_sql, duplicate_search_params = search_condition(
+        search_spec,
+        ("COALESCE(fe.current_path, fe.canonical_uri)", "fe.current_hash"),
+    )
     normalized_path = normalize_path_prefix(path_prefix).lower()
     path_like = f"{normalized_path}/%" if normalized_path else ""
     repo_ctx, active_branch = resolve_active_branch(root, path_prefix, branch)
@@ -1309,6 +1382,7 @@ def fetch_duplicate_files(root: Path, query: str, path_prefix: str, branch: str,
             file_state_filter = "AND bs.git_state = ?"
             duplicate_state_filter = "AND bs_all.git_state = ?"
     conn = connect_db(root)
+    attach_search_function(conn, search_spec)
     try:
         return conn.execute(
             f"""
@@ -1343,11 +1417,7 @@ def fetch_duplicate_files(root: Path, query: str, path_prefix: str, branch: str,
                         OR lower(COALESCE(fe.current_path, fe.canonical_uri)) = ?
                         OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
                       )
-                  AND (
-                        ? = ''
-                        OR lower(COALESCE(fe.current_path, fe.canonical_uri)) LIKE ?
-                        OR lower(fe.current_hash) LIKE ?
-                      )
+                  AND ({duplicate_search_sql})
             ),
             representative_files AS (
                 SELECT current_hash, MIN(file_id) AS representative_file_id
@@ -1375,17 +1445,19 @@ def fetch_duplicate_files(root: Path, query: str, path_prefix: str, branch: str,
                 normalized_path,
                 normalized_path,
                 path_like,
-                query,
-                like,
-                like,
+                *duplicate_search_params,
             ),
         ).fetchall()
     finally:
         conn.close()
 
 
-def fetch_transactions(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
-    like = f"%{query.lower()}%"
+def fetch_transactions(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> list[sqlite3.Row]:
+    search_spec = prepare_search_spec(query, search_mode)
+    tx_search_sql, tx_search_params = search_condition(
+        search_spec,
+        ("actor", "source", "message", "CAST(tx_id AS TEXT)"),
+    )
     normalized_path = normalize_path_prefix(path_prefix).lower()
     path_like = f"{normalized_path}/%" if normalized_path else ""
     repo_ctx, active_branch = resolve_active_branch(root, path_prefix, branch)
@@ -1400,19 +1472,14 @@ def fetch_transactions(root: Path, query: str, path_prefix: str, branch: str, gi
         if active_git_state:
             exists_state_filter = "AND bs.git_state = ?"
     conn = connect_db(root)
+    attach_search_function(conn, search_spec)
     try:
         return conn.execute(
             f"""
             {cte}
             SELECT tx_id, tx_time, actor, source, message
             FROM tx
-            WHERE (
-                    ? = ''
-                    OR lower(COALESCE(actor, '')) LIKE ?
-                    OR lower(COALESCE(source, '')) LIKE ?
-                    OR lower(COALESCE(message, '')) LIKE ?
-                    OR CAST(tx_id AS TEXT) = ?
-                  )
+            WHERE ({tx_search_sql})
               AND (
                     ? = ''
                     OR EXISTS (
@@ -1434,7 +1501,8 @@ def fetch_transactions(root: Path, query: str, path_prefix: str, branch: str, gi
             """,
             cte_params
             + ((active_git_state,) if active_git_state else ())
-            + (query, like, like, like, query, normalized_path, normalized_path, path_like),
+            + tx_search_params
+            + (normalized_path, normalized_path, path_like),
         ).fetchall()
     finally:
         conn.close()
@@ -2116,7 +2184,7 @@ def nav_button(name: str, active: str) -> str:
     active_class = "active" if name == active else ""
     return (
         f'<button class="{active_class}" hx-get="/partials/{name}" '
-        f'hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">{labels[name]}</button>'
+        f'hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>{labels[name]}</button>'
     )
 
 
@@ -2149,7 +2217,7 @@ def render_path_filter(root: Path, path_prefix: str, branch: str, git_state: str
             )
     oob_attr = ' hx-swap-oob="outerHTML"' if oob else ""
     return f"""
-<form id="path-filter" class="toolbar" hx-get="/partials/files" hx-target="#content" hx-swap="innerHTML"{oob_attr}>
+<form id="path-filter" class="toolbar" hx-get="/partials/files" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}{oob_attr}>
   <input
     id="path-input"
     type="search"
@@ -2187,12 +2255,12 @@ def render_stats_panel(root: Path, path_prefix: str, branch: str, git_state: str
 <div id="stats-panel" class="panel hero-card"{oob_attr}>
   <div class="stats">
     <div class="stat"><span>Files</span><strong>{stats['files_count']}</strong></div>
-    <button class="stat stat-link" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <button class="stat stat-link" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
       <span>Duplicate Files</span><strong>{stats['duplicate_files_count']}</strong>
     </button>
     <div class="stat"><span>Blobs</span><strong>{stats['blobs_count']}</strong></div>
     <div class="stat"><span>Transactions</span><strong>{stats['tx_count']}</strong></div>
-    <button class="stat stat-link" hx-get="/partials/repos" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <button class="stat stat-link" hx-get="/partials/repos" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
       <span>Repos Scanned</span><strong>{stats['repos_count']}</strong>
     </button>
   </div>
@@ -2220,7 +2288,7 @@ def render_tree_node(node: PathTreeNode, active_path: str) -> str:
     path_param = quote(node.path or ".")
     title = h(node.path or ".")
     button = f"""
-<button class="tree-link{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" title="{title}">
+<button class="tree-link{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR} title="{title}">
   <span class="tree-label">{h(node.label)}</span>
   <span class="tree-count">{node.files_count}</span>
 </button>
@@ -2238,7 +2306,7 @@ def render_tree_node(node: PathTreeNode, active_path: str) -> str:
       <span class="tree-label">{h(node.label)}</span>
       <span class="tree-count">{node.files_count}</span>
     </summary>
-    <button class="tree-link tree-select{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" title="{title}">
+    <button class="tree-link tree-select{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR} title="{title}">
       <span class="tree-label">View</span>
       <span class="tree-count">{node.files_count}</span>
     </button>
@@ -2267,6 +2335,7 @@ def build_browser_url(
     branch: str,
     git_state: str,
     query: str = "",
+    search_mode: str = "text",
     selected_file_id: Optional[int] = None,
     sql_query: str = "",
 ) -> str:
@@ -2275,6 +2344,7 @@ def build_browser_url(
     normalized_branch = normalize_branch_name(branch)
     normalized_git_state = git_state.strip().lower()
     normalized_query = query.strip()
+    normalized_search_mode = normalize_search_mode(search_mode)
     normalized_sql_query = normalize_sql_query(sql_query)
     if normalized_path:
         params.append(("path", normalized_path))
@@ -2284,6 +2354,8 @@ def build_browser_url(
         params.append(("git_state", normalized_git_state))
     if normalized_query:
         params.append(("q", normalized_query))
+        if normalized_search_mode != "text":
+            params.append(("mode", normalized_search_mode))
     if normalize_view_name(view) == "sql" and normalized_sql_query:
         params.append(("sql", normalized_sql_query))
     if normalize_view_name(view) == "files" and selected_file_id is not None:
@@ -2291,15 +2363,38 @@ def build_browser_url(
     return "/?" + urlencode(params)
 
 
+def render_search_mode_select(search_mode: str) -> str:
+    normalized = normalize_search_mode(search_mode)
+    text_selected = " selected" if normalized == "text" else ""
+    regex_selected = " selected" if normalized == "regex" else ""
+    return f"""
+      <select name="mode" aria-label="Search mode">
+        <option value="text"{text_selected}>Text</option>
+        <option value="regex"{regex_selected}>Regex</option>
+      </select>
+"""
+
+
+def render_search_error(error: SearchPatternError) -> str:
+    return f'<div class="notice error"><strong>Invalid regex</strong><span>{h(error)}</span></div>'
+
+
 def render_files_partial(
     root: Path,
     query: str,
+    search_mode: str,
     path_prefix: str,
     branch: str,
     git_state: str,
     selected_file_id: Optional[int] = None,
 ) -> str:
-    rows = fetch_files(root, query, path_prefix, branch, git_state)
+    normalized_search_mode = normalize_search_mode(search_mode)
+    search_error = ""
+    try:
+        rows = fetch_files(root, query, normalized_search_mode, path_prefix, branch, git_state)
+    except SearchPatternError as exc:
+        rows = []
+        search_error = render_search_error(exc)
     active_file_id: Optional[int] = None
     if rows:
         row_ids = {int(row["file_id"]) for row in rows}
@@ -2330,10 +2425,12 @@ def render_files_partial(
     return f"""
 <div class="split">
   <section class="stack">
-    <form id="files-query-form" class="toolbar" hx-get="/partials/files" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <form id="files-query-form" class="toolbar" hx-get="/partials/files" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
       <input type="search" name="q" value="{h(query)}" placeholder="Filter by path, type, hash, or metadata">
+      {render_search_mode_select(normalized_search_mode)}
       <button type="submit">Search</button>
     </form>
+    {search_error}
     <div class="list">{listing}</div>
   </section>
   <section id="file-detail">{detail_html}</section>
@@ -2665,8 +2762,14 @@ def render_history_table(rows: list[sqlite3.Row]) -> str:
     return "<table><thead><tr><th>Time</th><th>Attribute</th><th>Op</th><th>Value</th></tr></thead><tbody>" + "".join(body) + "</tbody></table>"
 
 
-def render_blobs_partial(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> str:
-    rows = fetch_blobs(root, query, path_prefix, branch, git_state)
+def render_blobs_partial(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> str:
+    normalized_search_mode = normalize_search_mode(search_mode)
+    search_error = ""
+    try:
+        rows = fetch_blobs(root, query, normalized_search_mode, path_prefix, branch, git_state)
+    except SearchPatternError as exc:
+        rows = []
+        search_error = render_search_error(exc)
     if rows:
         body = "".join(
             f"""
@@ -2685,17 +2788,25 @@ def render_blobs_partial(root: Path, query: str, path_prefix: str, branch: str, 
         table = empty_state("No blobs matched this query.")
     return f"""
 <div class="stack">
-  <form class="toolbar" hx-get="/partials/blobs" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+  <form class="toolbar" hx-get="/partials/blobs" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
     <input type="search" name="q" value="{h(query)}" placeholder="Filter by blob hash or storage path">
+    {render_search_mode_select(normalized_search_mode)}
     <button type="submit">Search</button>
   </form>
+  {search_error}
   <div class="card">{table}</div>
 </div>
 """
 
 
-def render_duplicates_partial(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> str:
-    rows = fetch_duplicate_files(root, query, path_prefix, branch, git_state)
+def render_duplicates_partial(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> str:
+    normalized_search_mode = normalize_search_mode(search_mode)
+    search_error = ""
+    try:
+        rows = fetch_duplicate_files(root, query, normalized_search_mode, path_prefix, branch, git_state)
+    except SearchPatternError as exc:
+        rows = []
+        search_error = render_search_error(exc)
     if rows:
         body = "".join(
             f"""
@@ -2722,10 +2833,12 @@ def render_duplicates_partial(root: Path, query: str, path_prefix: str, branch: 
         table = empty_state("No duplicate files matched this query.")
     return f"""
 <div class="stack">
-  <form class="toolbar" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+  <form class="toolbar" hx-get="/partials/duplicates" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
     <input type="search" name="q" value="{h(query)}" placeholder="Filter duplicate files by path or hash">
+    {render_search_mode_select(normalized_search_mode)}
     <button type="submit">Show Duplicates</button>
   </form>
+  {search_error}
   {summary}
   <div class="card">{table}</div>
 </div>
@@ -2744,6 +2857,7 @@ def render_repos_partial(root: Path, path_prefix: str) -> str:
       hx-get="/partials/files?path={quote(row.repo_root or '.')}"
       hx-target="#content"
       hx-swap="innerHTML"
+      {CONTENT_SYNC_ATTR}
     ><strong>{h(row.repo_root or '.')}</strong></button>
   </th>
   <td>{h(', '.join(row.branches) or '-')}</td>
@@ -2786,13 +2900,14 @@ def render_roots_partial(root: Path, path_prefix: str, message: Optional[ActionM
       hx-get="/partials/files?path={quote(row.scan_root or '.')}"
       hx-target="#content"
       hx-swap="innerHTML"
+      {CONTENT_SYNC_ATTR}
     ><strong>{h(row.scan_root or '.')}</strong></button>
   </th>
   <td>{row.files_count}</td>
   <td>{row.scans_count}</td>
   <td>{h(row.latest_scan_time or '-')}</td>
   <td>
-    <form class="root-watch" hx-post="/actions/root-watch" hx-trigger="change" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <form class="root-watch" hx-post="/actions/root-watch" hx-trigger="change" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
       <input type="hidden" name="root" value="{h(row.scan_root or '.')}">
       <label class="watch-toggle">
         <input type="checkbox" name="enabled" value="1"{" checked" if watch_summary(row.scan_root or ".").active else ""}>
@@ -2802,7 +2917,7 @@ def render_roots_partial(root: Path, path_prefix: str, message: Optional[ActionM
     <div class="watch-status">{h(f"{watch_summary(row.scan_root or '.').pending_files} pending" if watch_summary(row.scan_root or '.').active else "off")}</div>
   </td>
   <td>
-    <form class="root-actions" hx-post="/actions/root" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+    <form class="root-actions" hx-post="/actions/root" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
       <input type="hidden" name="root" value="{h(row.scan_root or '.')}">
       <button type="submit" name="action" value="scan">Scan</button>
       <button type="submit" class="danger" name="action" value="forget" hx-confirm="Forget all tracked data for {h(row.scan_root or '.')}?">Forget</button>
@@ -2824,8 +2939,14 @@ def render_roots_partial(root: Path, path_prefix: str, message: Optional[ActionM
 """
 
 
-def render_tx_partial(root: Path, query: str, path_prefix: str, branch: str, git_state: str) -> str:
-    rows = fetch_transactions(root, query, path_prefix, branch, git_state)
+def render_tx_partial(root: Path, query: str, search_mode: str, path_prefix: str, branch: str, git_state: str) -> str:
+    normalized_search_mode = normalize_search_mode(search_mode)
+    search_error = ""
+    try:
+        rows = fetch_transactions(root, query, normalized_search_mode, path_prefix, branch, git_state)
+    except SearchPatternError as exc:
+        rows = []
+        search_error = render_search_error(exc)
     if rows:
         body = "".join(
             f"""
@@ -2844,10 +2965,12 @@ def render_tx_partial(root: Path, query: str, path_prefix: str, branch: str, git
         table = empty_state("No transactions matched this query.")
     return f"""
 <div class="stack">
-  <form class="toolbar" hx-get="/partials/tx" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+  <form class="toolbar" hx-get="/partials/tx" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
     <input type="search" name="q" value="{h(query)}" placeholder="Filter by actor, source, message, or tx id">
+    {render_search_mode_select(normalized_search_mode)}
     <button type="submit">Search</button>
   </form>
+  {search_error}
   <div class="card">{table}</div>
 </div>
 """
@@ -2923,7 +3046,7 @@ def render_sql_partial(root: Path, sql_query: str, path_prefix: str, branch: str
         results_html = truncation_note + "<div class=\"card\"><table><thead><tr>" + header_html + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>"
     return f"""
 <div class="stack">
-  <form class="toolbar" hx-get="/partials/sql" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML">
+  <form class="toolbar" hx-get="/partials/sql" hx-include="#path-filter" hx-target="#content" hx-swap="innerHTML" {CONTENT_SYNC_ATTR}>
     <textarea name="sql" spellcheck="false" placeholder="SELECT current_path FROM file_entry ORDER BY current_path LIMIT 20">{h(normalized_query)}</textarea>
     <button type="submit">Run Query</button>
   </form>
@@ -2979,6 +3102,7 @@ def render_root_content(
     root: Path,
     view: str,
     query: str,
+    search_mode: str,
     sql_query: str,
     path_prefix: str,
     branch: str,
@@ -2990,14 +3114,14 @@ def render_root_content(
     if view == "roots":
         return render_roots_partial(root, path_prefix)
     if view == "duplicates":
-        return render_duplicates_partial(root, query, path_prefix, branch, git_state)
+        return render_duplicates_partial(root, query, search_mode, path_prefix, branch, git_state)
     if view == "blobs":
-        return render_blobs_partial(root, query, path_prefix, branch, git_state)
+        return render_blobs_partial(root, query, search_mode, path_prefix, branch, git_state)
     if view == "tx":
-        return render_tx_partial(root, query, path_prefix, branch, git_state)
+        return render_tx_partial(root, query, search_mode, path_prefix, branch, git_state)
     if view == "sql":
         return render_sql_partial(root, sql_query, path_prefix, branch, git_state)
-    return render_files_partial(root, query, path_prefix, branch, git_state, selected_file_id)
+    return render_files_partial(root, query, search_mode, path_prefix, branch, git_state, selected_file_id)
 
 
 class BrowserHandler(BaseHTTPRequestHandler):
@@ -3010,6 +3134,7 @@ class BrowserHandler(BaseHTTPRequestHandler):
         branch = query_value(query, "branch")
         git_state = query_value(query, "git_state")
         text_query = query_value(query, "q")
+        search_mode = normalize_search_mode(query_value(query, "mode"))
         sql_query = query_value(query, "sql")
         selected_file_id = query_int_value(query, "file")
         if path == "/":
@@ -3017,6 +3142,7 @@ class BrowserHandler(BaseHTTPRequestHandler):
                 self.repo_root,
                 view,
                 text_query,
+                search_mode,
                 sql_query,
                 path_prefix,
                 branch,
@@ -3026,10 +3152,10 @@ class BrowserHandler(BaseHTTPRequestHandler):
             self.respond_html(render_layout(self.repo_root, view, path_prefix, branch, git_state, content))
             return
         if path == "/partials/files":
-            content = render_files_partial(self.repo_root, text_query, path_prefix, branch, git_state, selected_file_id)
+            content = render_files_partial(self.repo_root, text_query, search_mode, path_prefix, branch, git_state, selected_file_id)
             self.respond_html(
                 render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
-                headers={"HX-Push-Url": build_browser_url("files", path_prefix, branch, git_state, text_query, selected_file_id)},
+                headers={"HX-Push-Url": build_browser_url("files", path_prefix, branch, git_state, text_query, search_mode, selected_file_id)},
             )
             return
         if path == "/partials/repos":
@@ -3047,10 +3173,10 @@ class BrowserHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/partials/duplicates":
-            content = render_duplicates_partial(self.repo_root, text_query, path_prefix, branch, git_state)
+            content = render_duplicates_partial(self.repo_root, text_query, search_mode, path_prefix, branch, git_state)
             self.respond_html(
                 render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
-                headers={"HX-Push-Url": build_browser_url("duplicates", path_prefix, branch, git_state, text_query)},
+                headers={"HX-Push-Url": build_browser_url("duplicates", path_prefix, branch, git_state, text_query, search_mode)},
             )
             return
         if path == "/partials/path-suggestions":
@@ -3067,7 +3193,7 @@ class BrowserHandler(BaseHTTPRequestHandler):
                 file_id = int(tail)
                 self.respond_html(
                     render_file_detail(self.repo_root, file_id, path_prefix, branch),
-                    headers={"HX-Push-Url": build_browser_url("files", path_prefix, branch, git_state, text_query, file_id)},
+                    headers={"HX-Push-Url": build_browser_url("files", path_prefix, branch, git_state, text_query, search_mode, file_id)},
                 )
                 return
         if path.startswith("/partials/blob-preview/"):
@@ -3100,17 +3226,17 @@ class BrowserHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/partials/blobs":
-            content = render_blobs_partial(self.repo_root, text_query, path_prefix, branch, git_state)
+            content = render_blobs_partial(self.repo_root, text_query, search_mode, path_prefix, branch, git_state)
             self.respond_html(
                 render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
-                headers={"HX-Push-Url": build_browser_url("blobs", path_prefix, branch, git_state, text_query)},
+                headers={"HX-Push-Url": build_browser_url("blobs", path_prefix, branch, git_state, text_query, search_mode)},
             )
             return
         if path == "/partials/tx":
-            content = render_tx_partial(self.repo_root, text_query, path_prefix, branch, git_state)
+            content = render_tx_partial(self.repo_root, text_query, search_mode, path_prefix, branch, git_state)
             self.respond_html(
                 render_partial_response(self.repo_root, path_prefix, branch, git_state, content),
-                headers={"HX-Push-Url": build_browser_url("tx", path_prefix, branch, git_state, text_query)},
+                headers={"HX-Push-Url": build_browser_url("tx", path_prefix, branch, git_state, text_query, search_mode)},
             )
             return
         if path == "/partials/sql":
@@ -3208,7 +3334,10 @@ class BrowserHandler(BaseHTTPRequestHandler):
             for key, value in headers.items():
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("client disconnected before response completed: %s", self.path)
 
     def respond_blob(self, blob_hash: str) -> None:
         if not blob_hash or "/" in blob_hash or len(blob_hash) < 3:
@@ -3232,7 +3361,11 @@ class BrowserHandler(BaseHTTPRequestHandler):
                 chunk = handle.read(1024 * 64)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.log_message("client disconnected before blob response completed: %s", self.path)
+                    return
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("[sysbrowse] " + fmt % args + "\n")
