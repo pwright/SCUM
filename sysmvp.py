@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Iterable, Optional
 
 DB_NAME = ".sysmvp.db"
@@ -191,6 +193,45 @@ def scope_matches_path(path_value: str, scope: str) -> bool:
     return path_value == scope or path_value.startswith(scope + "/")
 
 
+def path_relative_to_scope(path_value: str, scope: str) -> str:
+    if scope == "":
+        return path_value
+    if path_value == scope:
+        return Path(path_value).name
+    if path_value.startswith(scope + "/"):
+        return path_value[len(scope) + 1 :]
+    raise ValueError(f"{path_value} is not under {scope}")
+
+
+def relative_file_depth(rel_path: str) -> int:
+    parent_parts = PurePosixPath(rel_path).parent.parts
+    if parent_parts in ((), (".",)):
+        return 0
+    return len(parent_parts)
+
+
+def parse_size_limit(value: str) -> int:
+    raw = value.strip().lower()
+    match = re.fullmatch(r"(\d+)([kmgt]?b?)?", raw)
+    if match is None:
+        raise argparse.ArgumentTypeError("expected bytes or a size like 500k, 5m, 2g")
+    amount = int(match.group(1))
+    suffix = match.group(2) or ""
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 * 1024,
+        "mb": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+        "t": 1024 * 1024 * 1024 * 1024,
+        "tb": 1024 * 1024 * 1024 * 1024,
+    }
+    return amount * multipliers[suffix]
+
+
 def normalize_scope_arg(root: Path, scope_value: str) -> str:
     raw = scope_value.strip()
     if not raw:
@@ -360,6 +401,8 @@ def scan_signature(
     scan_root: str,
     extract_meta_flag: bool,
     patterns: Iterable[str],
+    max_depth: Optional[int],
+    max_file_size: Optional[int],
 ) -> str:
     payload = {
         "version": SCAN_RESUME_VERSION,
@@ -367,6 +410,8 @@ def scan_signature(
         "extract_meta_flag": bool(extract_meta_flag),
         "ignore_patterns": list(patterns),
         "extensions_config": read_extensions_config(root),
+        "max_depth": max_depth,
+        "max_file_size": max_file_size,
     }
     return hashlib.sha256(stable_json_dumps(payload).encode("utf-8")).hexdigest()
 
@@ -923,7 +968,16 @@ def ensure_blob_preserved(conn: sqlite3.Connection, root: Path, file_path: Path,
     rel = f"{blob_hash[:2]}/{blob_hash}"
     blob_path = store_root(root) / rel
     blob_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(file_path, blob_path)
+    blob_existed = blob_path.exists()
+    if blob_existed:
+        existing_size = blob_path.stat().st_size
+        if existing_size != size_bytes:
+            raise RuntimeError(
+                f"Existing blob object has unexpected size: {blob_path} "
+                f"size={existing_size} expected={size_bytes}"
+            )
+    else:
+        shutil.copy2(file_path, blob_path)
     conn.execute(
         """
         INSERT INTO blob_object (blob_hash, algo, size_bytes, storage_relpath, created_tx_id)
@@ -931,7 +985,10 @@ def ensure_blob_preserved(conn: sqlite3.Connection, root: Path, file_path: Path,
         """,
         (blob_hash, size_bytes, f".sysstore/objects/{rel}", tx_id),
     )
-    log(f"Preserved new blob {blob_hash[:12]} from {file_path}")
+    if blob_existed:
+        log(f"Reattached existing blob {blob_hash[:12]} from {blob_path}")
+    else:
+        log(f"Preserved new blob {blob_hash[:12]} from {file_path}")
 
 
 def ensure_file_entity(conn: sqlite3.Connection, rel_path: str, tx_id: int) -> int:
@@ -1030,6 +1087,26 @@ def append_fact(conn: sqlite3.Connection, tx_id: int, entity_id: int, attr_ident
         )
 
 
+def append_fact_retraction_from_row(conn: sqlite3.Connection, tx_id: int, row: sqlite3.Row) -> None:
+    value_columns = (
+        "value_text",
+        "value_int",
+        "value_real",
+        "value_bool",
+        "value_json",
+        "value_ref",
+        "value_blobref",
+    )
+    populated = [column for column in value_columns if row[column] is not None]
+    if len(populated) != 1:
+        raise RuntimeError(f"Expected exactly one fact value column, got {populated}")
+    value_column = populated[0]
+    conn.execute(
+        f"INSERT INTO fact (tx_id, entity_id, attr_id, {value_column}, added) VALUES (?, ?, ?, ?, 0)",
+        (tx_id, int(row["entity_id"]), int(row["attr_id"]), row[value_column]),
+    )
+
+
 def update_projection(
     conn: sqlite3.Connection,
     entity_id: int,
@@ -1091,6 +1168,13 @@ def append_file_scan_git(
             git_status_raw,
             git_state
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scan_id, file_id) DO UPDATE SET
+            git_repo_root = excluded.git_repo_root,
+            git_branch = excluded.git_branch,
+            git_head = excluded.git_head,
+            repo_rel_path = excluded.repo_rel_path,
+            git_status_raw = excluded.git_status_raw,
+            git_state = excluded.git_state
         """,
         (scan_id, entity_id, git_repo_root, git_branch, git_head, repo_rel_path, git_status_raw, git_state),
     )
@@ -1106,6 +1190,7 @@ def scan_file_entry(
     scan_id: int,
     actor: str,
     active_git_ctx: Optional[GitScanContext],
+    max_file_size: Optional[int],
 ) -> tuple[int, int]:
     ignored_path = ignore_match_path(root, scan_root, file_path)
     if is_ignored(ignored_path, patterns):
@@ -1117,6 +1202,9 @@ def scan_file_entry(
 
     stat_result = file_path.stat()
     size_bytes = int(stat_result.st_size)
+    if max_file_size is not None and size_bytes > max_file_size:
+        log(f"Skipping {rel_to_repo}: size={size_bytes} exceeds max={max_file_size}")
+        return 0, 1
     mtime = iso_mtime(stat_result)
     mime = detect_mime(file_path)
     kind = classify_kind(mime)
@@ -1175,6 +1263,7 @@ def process_scan_directory(
     actor: str,
     active_git_ctx: Optional[GitScanContext],
     resume: bool,
+    max_file_size: Optional[int],
 ) -> tuple[int, int]:
     filenames = list(filenames)
     dir_path = stored_path_value(root, current_dir) or "."
@@ -1227,6 +1316,7 @@ def process_scan_directory(
                 session.scan_id,
                 actor,
                 active_git_ctx,
+                max_file_size,
             )
             scanned += scanned_delta
             skipped += skipped_delta
@@ -1319,6 +1409,13 @@ def resolve_active_git_root(
     return None
 
 
+def directory_depth(scan_root: Path, current_dir: Path) -> int:
+    relative = current_dir.relative_to(scan_root)
+    if str(relative) == ".":
+        return 0
+    return len(relative.parts)
+
+
 def scan_repo(
     root: Path,
     scan_root: Path,
@@ -1327,10 +1424,16 @@ def scan_repo(
     single_file: bool = False,
     resume: bool = False,
     resume_reset: bool = False,
+    max_depth: Optional[int] = None,
+    max_file_size: Optional[int] = None,
 ) -> None:
     ensure_repo_exists(root)
     if single_file and (resume or resume_reset):
         raise SystemExit("--resume and --resume-reset are only supported with --root scans")
+    if single_file and max_depth is not None:
+        raise SystemExit("--depth is only supported with --root scans")
+    if max_depth is not None and max_depth < 0:
+        raise SystemExit("--depth must be greater than or equal to 0")
     enabled_extensions = load_enabled_extensions(root)
     if extract_meta_flag:
         log(f"--extract-meta is deprecated; configure {EXTENSIONS_FILE} instead")
@@ -1372,6 +1475,7 @@ def scan_repo(
                 scan_id,
                 actor,
                 None,
+                max_file_size,
             )
             scanned += scanned_delta
             skipped += skipped_delta
@@ -1382,7 +1486,7 @@ def scan_repo(
                 root,
                 scan_root_rel,
                 scan_git_ctx,
-                scan_signature(root, scan_root_rel, extract_meta_flag, patterns),
+                scan_signature(root, scan_root_rel, extract_meta_flag, patterns, max_depth, max_file_size),
                 resume=resume,
                 resume_reset=resume_reset,
             )
@@ -1394,19 +1498,23 @@ def scan_repo(
                 current_dir = Path(dirpath).resolve()
                 dirnames.sort()
                 filenames.sort()
+                current_depth = directory_depth(scan_root, current_dir)
 
                 kept_dirnames: list[str] = []
-                for dirname in dirnames:
-                    child_dir = current_dir / dirname
-                    child_rel = ignore_match_path(root, scan_root, child_dir)
-                    if is_ignored(child_rel, patterns):
-                        skipped += 1
-                        log(f"Ignoring {child_rel}")
-                        if session is not None:
-                            log_scan_event(session, "dir_ignore", dir=child_rel)
-                        continue
-                    kept_dirnames.append(dirname)
-                dirnames[:] = kept_dirnames
+                if max_depth is not None and current_depth >= max_depth:
+                    dirnames[:] = []
+                else:
+                    for dirname in dirnames:
+                        child_dir = current_dir / dirname
+                        child_rel = ignore_match_path(root, scan_root, child_dir)
+                        if is_ignored(child_rel, patterns):
+                            skipped += 1
+                            log(f"Ignoring {child_rel}")
+                            if session is not None:
+                                log_scan_event(session, "dir_ignore", dir=child_rel)
+                            continue
+                        kept_dirnames.append(dirname)
+                    dirnames[:] = kept_dirnames
 
                 if has_local_git_entry(current_dir) and current_dir not in git_ctx_cache:
                     git_ctx = capture_git_scan_context(root, current_dir)
@@ -1431,6 +1539,7 @@ def scan_repo(
                     actor,
                     active_git_ctx,
                     resume=resume,
+                    max_file_size=max_file_size,
                 )
                 scanned += scanned_delta
                 skipped += skipped_delta
@@ -1558,6 +1667,148 @@ def retract_fact(
     finally:
         conn.close()
     log(f"Retracted fact for entity={entity_id} attr={attr_ident}")
+
+
+def remove_tree(root: Path, scope_value: str, actor: str) -> None:
+    ensure_repo_exists(root)
+    scope = normalize_scope_arg(root, scope_value)
+    scope_label = scope or "."
+    conn = connect_db(root)
+    conn.execute("BEGIN")
+    try:
+        file_rows = conn.execute(
+            """
+            SELECT file_id, COALESCE(current_path, canonical_uri) AS path_value
+            FROM file_entry
+            WHERE is_deleted = 0
+            ORDER BY file_id
+            """
+        ).fetchall()
+        matched_file_ids = [
+            int(row["file_id"])
+            for row in file_rows
+            if scope_matches_path(str(row["path_value"] or ""), scope)
+        ]
+
+        retracted_facts = 0
+        if matched_file_ids:
+            placeholders = ",".join("?" for _ in matched_file_ids)
+            tx_id = create_tx(conn, actor=actor, source="remove", message=f"remove {scope_label}")
+            fact_rows = conn.execute(
+                f"""
+                SELECT
+                    entity_id,
+                    attr_id,
+                    value_text,
+                    value_int,
+                    value_real,
+                    value_bool,
+                    value_json,
+                    value_ref,
+                    value_blobref
+                FROM v_current_fact
+                WHERE entity_id IN ({placeholders})
+                ORDER BY entity_id, attr_id, fact_id
+                """,
+                tuple(matched_file_ids),
+            ).fetchall()
+            for fact_row in fact_rows:
+                append_fact_retraction_from_row(conn, tx_id, fact_row)
+            retracted_facts = len(fact_rows)
+            conn.execute(
+                f"UPDATE file_entry SET is_deleted = 1 WHERE file_id IN ({placeholders})",
+                tuple(matched_file_ids),
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    log(f"Remove complete: scope={scope_label} files={len(matched_file_ids)} facts={retracted_facts}")
+
+
+def write_current_files(root: Path, scope_value: str, output_value: str, max_depth: Optional[int], overwrite: bool) -> None:
+    ensure_repo_exists(root)
+    if max_depth is not None and max_depth < 0:
+        raise SystemExit("--depth must be greater than or equal to 0")
+
+    scope = normalize_scope_arg(root, scope_value)
+    scope_label = scope or "."
+    output_root = Path(output_value).expanduser().resolve()
+    conn = connect_db(root)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                fe.file_id,
+                COALESCE(fe.current_path, fe.canonical_uri) AS path_value,
+                fe.current_hash,
+                bo.storage_relpath
+            FROM file_entry fe
+            LEFT JOIN blob_object bo ON bo.blob_hash = fe.current_hash
+            WHERE fe.is_deleted = 0
+            ORDER BY path_value
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    export_items: list[tuple[str, Path, Path]] = []
+    missing_blobs: list[str] = []
+    existing_targets: list[Path] = []
+    blocked_targets: list[Path] = []
+    for row in rows:
+        path_value = str(row["path_value"] or "")
+        if not scope_matches_path(path_value, scope):
+            continue
+        rel_path = path_relative_to_scope(path_value, scope)
+        rel_path = rel_path.lstrip("/")
+        if max_depth is not None and relative_file_depth(rel_path) > max_depth:
+            continue
+        blob_relpath = row["storage_relpath"]
+        if blob_relpath is None:
+            missing_blobs.append(path_value)
+            continue
+        blob_path = root / str(blob_relpath)
+        if not blob_path.is_file():
+            missing_blobs.append(path_value)
+            continue
+        target_path = (output_root / PurePosixPath(rel_path)).resolve()
+        try:
+            target_path.relative_to(output_root)
+        except ValueError:
+            blocked_targets.append(target_path)
+            continue
+        if target_path.exists() and target_path.is_dir():
+            blocked_targets.append(target_path)
+            continue
+        if target_path.exists() and not overwrite:
+            existing_targets.append(target_path)
+            continue
+        export_items.append((path_value, blob_path, target_path))
+
+    if missing_blobs:
+        sample = ", ".join(missing_blobs[:5])
+        suffix = "" if len(missing_blobs) <= 5 else f", ... ({len(missing_blobs)} total)"
+        raise SystemExit(f"Cannot write files with missing blob content: {sample}{suffix}")
+    if blocked_targets:
+        sample = ", ".join(str(path) for path in blocked_targets[:5])
+        suffix = "" if len(blocked_targets) <= 5 else f", ... ({len(blocked_targets)} total)"
+        raise SystemExit(f"Refusing to write outside output directory or over a directory: {sample}{suffix}")
+    if existing_targets:
+        sample = ", ".join(str(path) for path in existing_targets[:5])
+        suffix = "" if len(existing_targets) <= 5 else f", ... ({len(existing_targets)} total)"
+        raise SystemExit(f"Output file already exists; pass --overwrite to replace: {sample}{suffix}")
+
+    for path_value, blob_path, target_path in export_items:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(blob_path, target_path)
+        log(f"Wrote {path_value} -> {target_path}")
+
+    log(f"Write complete: scope={scope_label} output={output_root} files={len(export_items)}")
 
 
 def forget_root(root: Path, scope_value: str) -> None:
@@ -1743,6 +1994,18 @@ def build_parser() -> argparse.ArgumentParser:
     scan_target_group = scan_parser.add_mutually_exclusive_group()
     scan_target_group.add_argument("--root", help="Filesystem root directory to scan")
     scan_target_group.add_argument("--file", help="Single file to scan")
+    scan_parser.add_argument("target", nargs="?", help="Filesystem root directory to scan")
+    scan_parser.add_argument(
+        "--depth",
+        type=int,
+        help="Maximum directory depth to scan relative to the root; 0 scans only files directly under the root",
+    )
+    scan_parser.add_argument(
+        "--max",
+        dest="max_file_size",
+        type=parse_size_limit,
+        help="Skip files larger than this size, e.g. 500k, 5m, 2g",
+    )
     scan_parser.add_argument(
         "--extract-meta",
         action="store_true",
@@ -1774,6 +2037,19 @@ def build_parser() -> argparse.ArgumentParser:
     retract_parser.add_argument("--value-blobref")
     retract_parser.add_argument("--value-json")
 
+    remove_parser = sub.add_parser("remove", help="Prune a file or directory tree from the current projection")
+    remove_parser.add_argument("scope", help="Repo-relative or absolute file/directory tree to remove")
+
+    write_parser = sub.add_parser("write", help="Write current files from the projection to a directory")
+    write_parser.add_argument("scope", help="Repo-relative or absolute file/directory tree to write")
+    write_parser.add_argument(
+        "--depth",
+        type=int,
+        help="Maximum directory depth to write relative to the scope; 0 writes only files directly under the scope",
+    )
+    write_parser.add_argument("-o", "--output", required=True, help="Output directory")
+    write_parser.add_argument("--overwrite", action="store_true", help="Replace existing output files")
+
     asof_parser = sub.add_parser("as-of", help="Show latest active facts as of a time")
     asof_parser.add_argument("entity_id", type=int)
     asof_parser.add_argument("--time", required=True, help="UTC timestamp, e.g. 2026-04-21T12:00:00Z")
@@ -1794,7 +2070,15 @@ def main() -> int:
         init_repo(root)
         return 0
     if args.command == "scan":
-        scan_target = args.file if args.file is not None else (args.root or ".")
+        if args.target is not None and args.file is not None:
+            parser.error("scan target cannot be used with --file")
+        if args.target is not None and args.root is not None:
+            parser.error("scan target cannot be used with --root")
+        if args.depth is not None and args.file is not None:
+            parser.error("--depth is only supported with directory scans")
+        if args.depth is not None and args.depth < 0:
+            parser.error("--depth must be greater than or equal to 0")
+        scan_target = args.file if args.file is not None else (args.root or args.target or ".")
         scan_repo(
             root,
             Path(scan_target).resolve(),
@@ -1803,6 +2087,8 @@ def main() -> int:
             single_file=args.file is not None,
             resume=args.resume,
             resume_reset=args.resume_reset,
+            max_depth=args.depth,
+            max_file_size=args.max_file_size,
         )
         return 0
     if args.command == "list":
@@ -1822,6 +2108,14 @@ def main() -> int:
             args.value_json,
             args.actor,
         )
+        return 0
+    if args.command == "remove":
+        remove_tree(root, args.scope, args.actor)
+        return 0
+    if args.command == "write":
+        if args.depth is not None and args.depth < 0:
+            parser.error("--depth must be greater than or equal to 0")
+        write_current_files(root, args.scope, args.output, args.depth, args.overwrite)
         return 0
     if args.command == "as-of":
         as_of(root, args.entity_id, args.time, args.json)

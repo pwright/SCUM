@@ -35,6 +35,20 @@ python3 tests/pdf_preview_extension_smoke.py >/tmp/pdf-preview-extension-smoke.o
 cat /tmp/pdf-preview-extension-smoke.out >&2
 python3 tests/resume_scan_smoke.py >/tmp/resume-scan-smoke.out 2>/tmp/resume-scan-smoke.err
 cat /tmp/resume-scan-smoke.out >&2
+python3 tests/git_symlink_scan_smoke.py >/tmp/git-symlink-scan-smoke.out 2>/tmp/git-symlink-scan-smoke.err
+cat /tmp/git-symlink-scan-smoke.out >&2
+python3 tests/depth_scan_smoke.py >/tmp/depth-scan-smoke.out 2>/tmp/depth-scan-smoke.err
+cat /tmp/depth-scan-smoke.out >&2
+python3 tests/max_size_scan_smoke.py >/tmp/max-size-scan-smoke.out 2>/tmp/max-size-scan-smoke.err
+cat /tmp/max-size-scan-smoke.out >&2
+python3 tests/existing_blob_smoke.py >/tmp/existing-blob-smoke.out 2>/tmp/existing-blob-smoke.err
+cat /tmp/existing-blob-smoke.out >&2
+python3 tests/remove_tree_smoke.py >/tmp/remove-tree-smoke.out 2>/tmp/remove-tree-smoke.err
+cat /tmp/remove-tree-smoke.out >&2
+python3 tests/write_tree_smoke.py >/tmp/write-tree-smoke.out 2>/tmp/write-tree-smoke.err
+cat /tmp/write-tree-smoke.out >&2
+python3 tests/tree_browser_smoke.py >/tmp/tree-browser-smoke.out 2>/tmp/tree-browser-smoke.err
+cat /tmp/tree-browser-smoke.out >&2
 python3 tests/root_watch_smoke.py >/tmp/root-watch-smoke.out 2>/tmp/root-watch-smoke.err
 cat /tmp/root-watch-smoke.out >&2
 python3 tests/server_smoke.py >/tmp/sysbrowse-smoke.out 2>/tmp/sysbrowse-smoke.err

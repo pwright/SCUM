@@ -149,6 +149,49 @@ That includes Windows cross-drive scans such as:
 python sysmvp.py scan --root D:\photos
 ```
 
+### Scan depth
+
+```bash
+python3 sysmvp.py scan --depth 2 ./examples/demo/
+```
+
+Depth is measured in directories below the scan root. `--depth 0` scans only
+files directly under the root; `--depth 2` includes files two nested directory
+levels below it.
+
+### Scan size limit
+
+```bash
+python3 sysmvp.py scan --max 5m ./examples/demo/
+```
+
+Files larger than the limit are skipped before hashing or preservation. The
+limit accepts raw bytes or `k`, `m`, `g`, and `t` suffixes.
+
+### Remove tree
+
+```bash
+python3 sysmvp.py remove ./examples/demo/subdir
+```
+
+This prunes matching files from the current projection and appends retraction
+facts. It does not purge historical facts or preserved blobs; a later scan can
+restore the files if they still exist on disk.
+
+### Write current files
+
+```bash
+python3 sysmvp.py write --depth 2 /home/paulwright/.ansible/ -o /tmp/ansible-export
+```
+
+This writes the current, non-pruned projection from preserved blobs into a new
+directory. Paths are written relative to the requested scope, so
+`/home/paulwright/.ansible/playbook.yml` becomes
+`/tmp/ansible-export/playbook.yml`. `--depth` uses the same directory-depth
+rules as `scan --depth`; omit it to write the full scope.
+
+Existing output files are not replaced unless you pass `--overwrite`.
+
 ### Scan one file
 
 ```bash
@@ -239,6 +282,13 @@ The browser UI provides:
 - version history for a file with links to older preserved blobs
 - file detail with immutable fact history
 - direct links to preserved blob bytes under `.sysstore/objects/...`
+
+### Tree browser
+
+The browser includes a left-hand tree of scanned roots and subdirectories. Use
+it to change the active path scope without typing a prefix manually. Directory
+branches can be expanded or collapsed; use the branch's View button to scope
+the main panel to that directory.
 
 ### Show history for one entity
 

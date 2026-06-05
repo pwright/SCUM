@@ -19,6 +19,11 @@ tmp/
 temp/
 *.tmp
 *.swp
+*.iso
+*.img
+*.qcow2
+*.vdi
+*.vmdk
 
 # Logs
 *.log
@@ -27,6 +32,70 @@ temp/
 .vscode/
 .idea/
 
+# OS metadata
+.DS_Store
+.AppleDouble/
+.LSOverride
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+
+# User trash
+.local/share/Trash/
+
 # Internal store
 .sysstore/
 .sysmvp.db
+*.db-shm
+*.db-wal
+
+# Package/build caches
+.nx/
+.cache/
+.gradle/
+.m2/repository/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.cargo/registry/
+.cargo/git/
+.rustup/
+.go/pkg/mod/
+.local/share/pnpm/
+
+# Secrets and credentials
+.ssh/
+.gnupg/
+.aws/
+.azure/
+.gcp/
+.kube/
+.docker/
+.password-store/
+.netrc
+
+# Browser/app profiles
+.config/google-chrome/
+.config/chromium/
+.config/BraveSoftware/
+.mozilla/
+Library/Application Support/Google/Chrome/
+Library/Application Support/Firefox/
+AppData/Local/Google/Chrome/
+AppData/Roaming/Mozilla/
+
+# VM/container state
+.lima/
+.colima/
+.vagrant/
+VirtualBox VMs/
+.vmware/
+
+# Runtime sockets and locks
+*.sock
+*.lock

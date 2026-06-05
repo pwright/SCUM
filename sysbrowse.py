@@ -72,6 +72,14 @@ class ScanRootSummary:
 
 
 @dataclass(frozen=True)
+class PathTreeNode:
+    path: str
+    label: str
+    files_count: int
+    children: tuple["PathTreeNode", ...]
+
+
+@dataclass(frozen=True)
 class ActionMessage:
     level: str
     title: str
@@ -782,6 +790,92 @@ def iter_path_prefixes(path_value: str) -> list[str]:
         return []
     parts = [part for part in normalized.split("/") if part]
     return ["/".join(parts[: index + 1]) for index in range(len(parts))]
+
+
+def path_in_scope(path_value: str, scope: str) -> bool:
+    normalized_path = normalize_path_prefix(path_value)
+    normalized_scope = normalize_path_prefix(scope)
+    if not normalized_scope:
+        return True
+    return normalized_path == normalized_scope or normalized_path.startswith(normalized_scope + "/")
+
+
+def child_path(parent: str, child: str) -> str:
+    normalized_parent = normalize_path_prefix(parent)
+    if not normalized_parent:
+        return child
+    return f"{normalized_parent}/{child}"
+
+
+def path_label(path_value: str) -> str:
+    normalized = normalize_path_prefix(path_value)
+    if not normalized:
+        return "."
+    return normalized.rsplit("/", 1)[-1] or normalized
+
+
+def build_path_tree_node(path_value: str, child_paths_by_parent: dict[str, set[str]], file_counts: dict[str, int]) -> PathTreeNode:
+    children = tuple(
+        build_path_tree_node(child_path_value, child_paths_by_parent, file_counts)
+        for child_path_value in sorted(child_paths_by_parent.get(path_value, set()), key=lambda value: value.lower())
+    )
+    return PathTreeNode(
+        path=path_value,
+        label=path_label(path_value),
+        files_count=file_counts.get(path_value, 0),
+        children=children,
+    )
+
+
+def fetch_path_tree(root: Path) -> tuple[PathTreeNode, ...]:
+    conn = connect_db(root)
+    try:
+        scan_rows = conn.execute(
+            """
+            SELECT DISTINCT COALESCE(NULLIF(scan_root, '.'), '') AS scan_root
+            FROM scan_run
+            ORDER BY COALESCE(NULLIF(scan_root, '.'), '') COLLATE NOCASE
+            """
+        ).fetchall()
+        file_rows = conn.execute(
+            """
+            SELECT COALESCE(current_path, canonical_uri) AS display_path
+            FROM file_entry
+            WHERE is_deleted = 0
+              AND COALESCE(current_path, canonical_uri) IS NOT NULL
+            ORDER BY COALESCE(current_path, canonical_uri) COLLATE NOCASE
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    roots = sorted({normalize_path_prefix(str(row["scan_root"])) for row in scan_rows}, key=lambda value: value.lower())
+    if not roots:
+        return ()
+
+    child_paths_by_parent: dict[str, set[str]] = {root_path: set() for root_path in roots}
+    file_counts: dict[str, int] = {root_path: 0 for root_path in roots}
+
+    sorted_roots_by_specificity = sorted(roots, key=len, reverse=True)
+    for row in file_rows:
+        display_path = normalize_path_prefix(str(row["display_path"]))
+        matching_root = next((root_path for root_path in sorted_roots_by_specificity if path_in_scope(display_path, root_path)), None)
+        if matching_root is None:
+            continue
+        file_counts[matching_root] = file_counts.get(matching_root, 0) + 1
+        relative_path = display_path
+        if matching_root:
+            relative_path = display_path.removeprefix(matching_root).lstrip("/")
+        parts = [part for part in relative_path.split("/") if part]
+        parent_path = matching_root
+        for part in parts[:-1]:
+            current_path = child_path(parent_path, part)
+            child_paths_by_parent.setdefault(parent_path, set()).add(current_path)
+            child_paths_by_parent.setdefault(current_path, set())
+            file_counts[current_path] = file_counts.get(current_path, 0) + 1
+            parent_path = current_path
+
+    return tuple(build_path_tree_node(root_path, child_paths_by_parent, file_counts) for root_path in roots)
 
 
 def fetch_repo_summaries(root: Path, path_prefix: str) -> list[RepoSummary]:
@@ -1551,6 +1645,114 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
       min-height: 60vh;
       padding: 20px;
     }}
+    .workspace {{
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }}
+    .tree-sidebar {{
+      padding: 14px;
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+    }}
+    .tree-title {{
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }}
+    .tree-list {{
+      display: grid;
+      gap: 4px;
+    }}
+    .tree-node {{
+      display: grid;
+      gap: 4px;
+    }}
+    .tree-node details {{
+      display: grid;
+      gap: 4px;
+    }}
+    .tree-node summary {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      list-style: none;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 7px 8px;
+      cursor: pointer;
+      color: var(--ink);
+    }}
+    .tree-node summary:hover {{
+      background: #f3f6fc;
+      border-color: #e1e7f0;
+    }}
+    .tree-node summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .tree-node details[open] > summary .tree-caret {{
+      transform: rotate(90deg);
+    }}
+    .tree-caret {{
+      color: var(--muted);
+      transition: transform 120ms ease;
+      flex: 0 0 auto;
+    }}
+    .tree-children {{
+      display: grid;
+      gap: 4px;
+      margin-left: 14px;
+      padding-left: 10px;
+      border-left: 1px solid var(--line);
+    }}
+    .tree-select {{
+      margin-left: 22px;
+      width: calc(100% - 22px);
+    }}
+    .tree-link {{
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 7px 8px;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .tree-link:hover {{
+      background: #f3f6fc;
+      border-color: #e1e7f0;
+    }}
+    .tree-link.active {{
+      background: var(--accent-soft);
+      border-color: #c7d5ff;
+      color: #1f4dbd;
+      font-weight: 700;
+    }}
+    .tree-label {{
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--mono);
+      font-size: 0.88rem;
+    }}
+    .tree-count {{
+      color: var(--muted);
+      font-size: 0.78rem;
+      flex: 0 0 auto;
+    }}
     .split {{
       display: grid;
       grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
@@ -1823,8 +2025,12 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
       background: #fff6f6;
     }}
     @media (max-width: 980px) {{
-      .hero, .split, .stats {{
+      .hero, .split, .stats, .workspace {{
         grid-template-columns: 1fr;
+      }}
+      .tree-sidebar {{
+        position: static;
+        max-height: 36vh;
       }}
       .content {{
         padding: 16px;
@@ -1852,7 +2058,10 @@ def render_layout(root: Path, initial_view: str, initial_path: str, initial_bran
       </div>
       {render_stats_panel(root, initial_path, initial_branch, initial_git_state)}
     </section>
-    <section id="content" class="panel content">{initial_content}</section>
+    <section class="workspace">
+      {render_tree_sidebar(root, initial_path)}
+      <section id="content" class="panel content">{initial_content}</section>
+    </section>
   </div>
   <script>
     (() => {{
@@ -1994,11 +2203,62 @@ def render_stats_panel(root: Path, path_prefix: str, branch: str, git_state: str
 
 
 def render_partial_response(root: Path, path_prefix: str, branch: str, git_state: str, content: str) -> str:
-    return render_path_filter(root, path_prefix, branch, git_state, oob=True) + render_stats_panel(root, path_prefix, branch, git_state, oob=True) + content
+    return (
+        render_path_filter(root, path_prefix, branch, git_state, oob=True)
+        + render_stats_panel(root, path_prefix, branch, git_state, oob=True)
+        + render_tree_sidebar(root, path_prefix, oob=True)
+        + content
+    )
 
 
 def render_path_suggestions(root: Path, path_prefix: str) -> str:
     return "".join(f'<option value="{h(suggestion)}"></option>' for suggestion in fetch_path_suggestions(root, path_prefix))
+
+
+def render_tree_node(node: PathTreeNode, active_path: str) -> str:
+    active_class = " active" if normalize_path_prefix(node.path) == active_path else ""
+    path_param = quote(node.path or ".")
+    title = h(node.path or ".")
+    button = f"""
+<button class="tree-link{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" title="{title}">
+  <span class="tree-label">{h(node.label)}</span>
+  <span class="tree-count">{node.files_count}</span>
+</button>
+"""
+    if not node.children:
+        return f'<div class="tree-node">{button}</div>'
+    children_html = "".join(render_tree_node(child, active_path) for child in node.children)
+    open_attr = " open" if path_in_scope(active_path, node.path) else ""
+    pref_key = h(f"tree:{node.path or '.'}")
+    return f"""
+<div class="tree-node">
+  <details{open_attr} data-pref-key="{pref_key}">
+    <summary title="Expand or collapse {title}">
+      <span class="tree-caret">›</span>
+      <span class="tree-label">{h(node.label)}</span>
+      <span class="tree-count">{node.files_count}</span>
+    </summary>
+    <button class="tree-link tree-select{active_class}" hx-get="/partials/files?path={path_param}" hx-target="#content" hx-swap="innerHTML" title="{title}">
+      <span class="tree-label">View</span>
+      <span class="tree-count">{node.files_count}</span>
+    </button>
+    <div class="tree-children">{children_html}</div>
+  </details>
+</div>
+"""
+
+
+def render_tree_sidebar(root: Path, path_prefix: str, oob: bool = False) -> str:
+    active_path = normalize_path_prefix(path_prefix)
+    nodes = fetch_path_tree(root)
+    body = "".join(render_tree_node(node, active_path) for node in nodes) if nodes else empty_state("No scanned roots yet.")
+    oob_attr = ' hx-swap-oob="outerHTML"' if oob else ""
+    return f"""
+<aside id="tree-sidebar" class="panel tree-sidebar"{oob_attr}>
+  <h2 class="tree-title">Roots</h2>
+  <div class="tree-list">{body}</div>
+</aside>
+"""
 
 
 def build_browser_url(
